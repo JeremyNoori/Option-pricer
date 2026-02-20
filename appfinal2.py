@@ -43,6 +43,8 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 #  THEME HELPERS (used by all plotly charts)
 # ─────────────────────────────────────────────
+# Read from session_state if available, else default to dark
+_dark = st.session_state.get('dark_mode', True) if hasattr(st, 'session_state') else True
 _PLT_BG   = '#0d1117' if _dark else '#ffffff'
 _PLT_BG2  = '#0a0c10' if _dark else '#f5f7fa'
 _PLT_GRID = '#1a2535' if _dark else '#e0e8f0'
