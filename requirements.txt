@@ -1,9 +1,7 @@
-numpy
-scipy
-pandas
-matplotlib
-plotly
-streamlit
-requests
-yfinance
-python-dateutil
+streamlit==1.42.0
+numpy==1.26.4
+pandas==2.2.0
+scipy==1.12.0
+plotly==5.18.0
+requests==2.31.0
+altair==5.2.0
