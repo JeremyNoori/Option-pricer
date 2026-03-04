@@ -17,7 +17,7 @@ try:
         save_strategy_result, load_quotes, load_vol_history
     )
     _SUPABASE_AVAILABLE = get_supabase_client() is not None
-except ImportError:
+except Exception:
     _SUPABASE_AVAILABLE = False
 import json
 from datetime import datetime, timedelta
