@@ -92,7 +92,7 @@ _CMC_HEADERS = {
 _CG_TO_CMC_SLUG = {
     "bitcoin":      "BTC",
     "ethereum":     "ETH",
-    "xdc-network":  "XDC",
+    "xdce-crowd-sale":  "XDC",
     "hyperliquid":  "HYPE",
     "solana":       "SOL",
 }
@@ -760,7 +760,7 @@ def monte_carlo_price(S, K, T, r, sigma, option_type='call', n_sims=50000, seed=
 
 def _fetch_xdc_price_raw():
     """Raw XDC price fetch with CMC fallback."""
-    return _fetch_coin_price("xdc-network", "XDC")
+    return _fetch_coin_price("xdce-crowd-sale", "XDC")
 
 
 def fetch_xdc_price():
@@ -776,7 +776,7 @@ def fetch_xdc_price():
 
 def _fetch_xdc_history_raw():
     """Raw 90d XDC history fetch with CMC fallback."""
-    return _fetch_coin_history("xdc-network", "XDC", 90)
+    return _fetch_coin_history("xdce-crowd-sale", "XDC", 90)
 
 
 def fetch_xdc_history():
@@ -862,7 +862,7 @@ def fetch_btc_history(days=90):
 def _fetch_xdc_extended_raw(days=180):
     """Raw extended XDC history + volumes fetch."""
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days={days}&interval=daily"
+        url = f"https://api.coingecko.com/api/v3/coins/xdce-crowd-sale/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = _cg_get(url)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
@@ -892,7 +892,7 @@ def fetch_xdc_extended(days=180):
 def _fetch_xdc_market_data_raw():
     """Raw XDC market data fetch (CoinGecko only — no CMC equivalent)."""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/xdc-network?localization=false&tickers=false&community_data=true&developer_data=false"
+        url = "https://api.coingecko.com/api/v3/coins/xdce-crowd-sale?localization=false&tickers=false&community_data=true&developer_data=false"
         r = _cg_get(url, timeout=10)
         data = r.json()
         md = data.get('market_data', {})
@@ -1517,7 +1517,7 @@ with st.sidebar:
 
     # ── Token selector ──────────────────────────────────
     TOKENS = {
-        "XDC  — XDC Network":    ("xdc-network",        "XDC",   0.035),
+        "XDC  — XDC Network":    ("xdce-crowd-sale",        "XDC",   0.035),
         "BTC  — Bitcoin":        ("bitcoin",                "BTC",   65000.0),
         "ETH  — Ethereum":       ("ethereum",               "ETH",   3500.0),
         "HYPE — Hyperliquid":    ("hyperliquid",            "HYPE",  20.0),
@@ -1553,8 +1553,8 @@ with st.sidebar:
         iv_spread = st.slider("OTC IV Spread (add to HV)", 0.0, 0.30, 0.10, 0.01)
         sigma = hv + iv_spread
     elif "Auto from" in vol_mode:
-        _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
-        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
+        _cid_vol = st.session_state.get("active_coin_id", "xdce-crowd-sale")
+        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdce-crowd-sale"
         _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
         price_hist = cached_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist:
@@ -1569,8 +1569,8 @@ with st.sidebar:
         iv_spread = st.slider("OTC Spread", 0.0, 0.30, 0.10, 0.01)
         sigma = hv + iv_spread
     else:  # EWMA
-        _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
-        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
+        _cid_vol = st.session_state.get("active_coin_id", "xdce-crowd-sale")
+        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdce-crowd-sale"
         _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
         price_hist = cached_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist and len(price_hist) > 5:
@@ -2390,8 +2390,8 @@ with tab5:
     )
 
     # ── DATA LOADING (all cached — no blocking on reruns) ──
-    _cid_md = st.session_state.get("active_coin_id", "xdc-network")
-    _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
+    _cid_md = st.session_state.get("active_coin_id", "xdce-crowd-sale")
+    _cid_md = _cid_md if _cid_md != "custom" else "xdce-crowd-sale"
     _ticker_md = st.session_state.get("active_token_ticker", "XDC")
 
     xdc_prices_ext = cached_coin_history(_cid_md, _ticker_md, 180)
@@ -4046,8 +4046,8 @@ with tab9:
     st.markdown(f'<div class="section-header">{_active_tok_vs} HISTORICAL VOL ANALYSIS</div>', unsafe_allow_html=True)
 
     # Fetch historical data for vol computation (Streamlit-cached)
-    _cid_vs = st.session_state.get("active_coin_id", "xdc-network")
-    _cid_vs = _cid_vs if _cid_vs != "custom" else "xdc-network"
+    _cid_vs = st.session_state.get("active_coin_id", "xdce-crowd-sale")
+    _cid_vs = _cid_vs if _cid_vs != "custom" else "xdce-crowd-sale"
     _ticker_vs = st.session_state.get("active_token_ticker", "XDC")
     xdc_hist_prices = cached_coin_history(_cid_vs, _ticker_vs, 365)
 
