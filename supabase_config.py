@@ -87,8 +87,16 @@ def get_supabase_client():
     if _supabase_client is not None:
         return _supabase_client
 
-    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+
+    # Try Streamlit secrets (may not exist if not configured)
+    if not url or not key:
+        try:
+            url = url or st.secrets.get("SUPABASE_URL", "")
+            key = key or st.secrets.get("SUPABASE_KEY", "")
+        except Exception:
+            pass
 
     if not url or not key:
         return None
