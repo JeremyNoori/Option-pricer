@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests supabase
+          pip install requests "supabase>=2.0.0,<3.0.0"
 
       - name: Run refresh
         env:

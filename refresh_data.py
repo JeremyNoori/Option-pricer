@@ -70,15 +70,18 @@ def get_client():
 
 def db_set(cache_key, data):
     """Upsert into market_data_cache."""
-    client = get_client()
-    client.table("market_data_cache").upsert(
-        {
-            "cache_key":  cache_key,
-            "data":       data,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-        on_conflict="cache_key",
-    ).execute()
+    try:
+        client = get_client()
+        client.table("market_data_cache").upsert(
+            {
+                "cache_key":  cache_key,
+                "data":       data,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="cache_key",
+        ).execute()
+    except Exception as e:
+        log(f"  DB write failed for {cache_key}: {e}")
 
 
 def log(msg):
@@ -130,7 +133,10 @@ def refresh_spot_prices():
         else:
             log(f"  {ticker}: ${price:.6f}")
 
-        db_set(f"price:{coin_id}", price)
+        try:
+            db_set(f"price:{coin_id}", price)
+        except Exception as e:
+            log(f"  {ticker}: DB write failed — {e}")
         time.sleep(1.5)  # respect CoinGecko rate limit
 
 
@@ -169,8 +175,11 @@ def refresh_price_history():
                     pass
 
             if prices:
-                db_set(key, prices)
-                log(f"  {ticker}/{days}d: {len(prices)} data points")
+                try:
+                    db_set(key, prices)
+                    log(f"  {ticker}/{days}d: {len(prices)} data points")
+                except Exception as e:
+                    log(f"  {ticker}/{days}d: DB write failed — {e}")
             else:
                 log(f"  {ticker}/{days}d: FAILED")
 
@@ -302,4 +311,8 @@ def refresh_all():
 
 
 if __name__ == "__main__":
-    refresh_all()
+    try:
+        refresh_all()
+    except Exception as e:
+        log(f"FATAL: {e}")
+        sys.exit(1)
