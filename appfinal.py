@@ -43,6 +43,33 @@ def _is_supabase_available():
         return False
 
 
+def _db_get(cache_key, max_age_s=7200):
+    """Read from Supabase DB cache. Returns None if unavailable/stale."""
+    try:
+        from supabase_config import db_cache_get
+        return db_cache_get(cache_key, max_age_s)
+    except Exception:
+        return None
+
+
+def _db_set(cache_key, data):
+    """Write to Supabase DB cache. Fire-and-forget."""
+    try:
+        from supabase_config import db_cache_set
+        db_cache_set(cache_key, data)
+    except Exception:
+        pass
+
+
+def _db_keys():
+    """List cache keys. For diagnostics."""
+    try:
+        from supabase_config import db_cache_keys
+        return db_cache_keys()
+    except Exception:
+        return {}
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  API KEYS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -125,9 +152,8 @@ def _cmc_history(symbol, days=90):
         return None
 
 
-def _fetch_coin_price(coin_id, ticker):
-    """Fetch live price: CoinGecko first, CMC fallback."""
-    # CoinGecko
+def _fetch_coin_price_live(coin_id, ticker):
+    """Fetch live price from APIs: CoinGecko first, CMC fallback."""
     try:
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
         r = _cg_get(url, timeout=5)
@@ -136,14 +162,12 @@ def _fetch_coin_price(coin_id, ticker):
             return price
     except Exception:
         pass
-    # CMC fallback
     cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, ticker)
     return _cmc_price(cmc_sym)
 
 
-def _fetch_coin_history(coin_id, ticker, days=90):
-    """Fetch price history: CoinGecko first, CMC fallback."""
-    # CoinGecko
+def _fetch_coin_history_live(coin_id, ticker, days=90):
+    """Fetch price history from APIs: CoinGecko first, CMC fallback."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = _cg_get(url)
@@ -152,13 +176,12 @@ def _fetch_coin_history(coin_id, ticker, days=90):
             return prices
     except Exception:
         pass
-    # CMC fallback
     cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, ticker)
     return _cmc_history(cmc_sym, days)
 
 
-def _fetch_coin_market_data(coin_id):
-    """Fetch detailed market data (CoinGecko only)."""
+def _fetch_coin_market_data_live(coin_id):
+    """Fetch detailed market data from CoinGecko."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=true&developer_data=false"
         r = _cg_get(url, timeout=10)
@@ -177,55 +200,106 @@ def _fetch_coin_market_data(coin_id):
         return {}
 
 
-# ── Streamlit-native caches (shared across all users + reruns) ─────
-# These prevent redundant API calls that cause rate-limiting and
-# the "Tried to use SessionInfo before it was initialized" crash.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  THREE-TIER CACHE:  @st.cache_data → Supabase DB → Live API
+#
+#  Tier 1: @st.cache_data   — in-memory, sub-ms, auto-TTL
+#  Tier 2: Supabase DB      — persistent, ~100ms, survives restarts
+#  Tier 3: Live API         — CoinGecko/CMC/Deribit, 1-8s
+#
+#  On first visit: Tier 1 miss → Tier 2 hit (instant) → done
+#  On cold start:  Tier 1 miss → Tier 2 miss → Tier 3 → store in DB
+#  Background cron refreshes Tier 2 every 2h so Tier 3 is rarely hit.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_coin_price(coin_id, ticker):
-    return _fetch_coin_price(coin_id, ticker)
+    """Spot price: DB (60s freshness) → live API."""
+    db = _db_get(f"price:{coin_id}", max_age_s=60)
+    if db is not None:
+        return db
+    result = _fetch_coin_price_live(coin_id, ticker)
+    if result is not None:
+        _db_set(f"price:{coin_id}", result)
+    return result
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_coin_history(coin_id, ticker, days=90):
-    return _fetch_coin_history(coin_id, ticker, days)
+    """Price history: DB (2h freshness) → live API."""
+    db = _db_get(f"history:{coin_id}:{days}", max_age_s=7200)
+    if db is not None:
+        return db
+    result = _fetch_coin_history_live(coin_id, ticker, days)
+    if result is not None:
+        _db_set(f"history:{coin_id}:{days}", result)
+    return result
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_coin_market_data(coin_id):
-    return _fetch_coin_market_data(coin_id)
+    """Market data: DB (2h freshness) → live API."""
+    db = _db_get(f"market_data:{coin_id}", max_age_s=7200)
+    if db is not None:
+        return db
+    result = _fetch_coin_market_data_live(coin_id)
+    if result:
+        _db_set(f"market_data:{coin_id}", result)
+    return result
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_fear_greed(days=30):
-    return _fetch_fear_greed_raw(days)
+    """Fear & Greed: DB (2h freshness) → live API."""
+    db = _db_get(f"fear_greed:{days}", max_age_s=7200)
+    if db is not None:
+        return db
+    result = _fetch_fear_greed_raw(days)
+    if result is not None:
+        _db_set(f"fear_greed:{days}", result)
+    return result
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_deribit_index(currency):
-    """Deribit index price — Streamlit-cached."""
+    """Deribit index: DB (2min) → live API."""
+    db = _db_get(f"deribit_index:{currency}", max_age_s=120)
+    if db is not None:
+        return db
     try:
         result = deribit_get("get_index_price", {"index_name": f"{currency.lower()}_usd"})
-        return result.get("index_price") if result else None
+        val = result.get("index_price") if result else None
+        if val is not None:
+            _db_set(f"deribit_index:{currency}", val)
+        return val
     except Exception:
         return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_deribit_book(currency):
-    """Deribit book summary — Streamlit-cached."""
+    """Deribit book: DB (2min) → live API."""
+    db = _db_get(f"deribit_book:{currency}", max_age_s=120)
+    if db is not None:
+        return db
     try:
         result = deribit_get("get_book_summary_by_currency", {
             "currency": currency.upper(), "kind": "option"
         })
-        return result or []
+        val = result or []
+        if val:
+            _db_set(f"deribit_book:{currency}", val)
+        return val
     except Exception:
         return []
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_deribit_dvol(currency, days=30):
-    """Deribit DVOL history — Streamlit-cached."""
+    """Deribit DVOL: DB (10min) → live API."""
+    db = _db_get(f"deribit_dvol:{currency}:{days}", max_age_s=600)
+    if db is not None:
+        return db
     try:
         result = deribit_get("get_volatility_index_data", {
             "currency":        currency.upper(),
@@ -234,7 +308,9 @@ def cached_deribit_dvol(currency, days=30):
             "resolution":      "3600"
         })
         if result and result.get("data"):
-            return [(row[0], row[4]) for row in result["data"]]
+            val = [(row[0], row[4]) for row in result["data"]]
+            _db_set(f"deribit_dvol:{currency}:{days}", val)
+            return val
         return None
     except Exception:
         return None
