@@ -1992,8 +1992,9 @@ with tab4:
         mc_exp_df = pd.DataFrame(mc_explorer_results)
 
         # Results table
+        mc_exp_df = mc_exp_df.sort_values('_mean_raw', ascending=False)
         display_cols_mc = [c for c in mc_exp_df.columns if not c.startswith('_')]
-        st.dataframe(mc_exp_df[display_cols_mc].sort_values('_mean_raw', key=lambda s: mc_exp_df['_mean_raw'], ascending=False),
+        st.dataframe(mc_exp_df[display_cols_mc],
                       use_container_width=True, hide_index=True)
 
         # Heatmap of mean returns: barrier vs coupon
