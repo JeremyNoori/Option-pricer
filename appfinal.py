@@ -70,6 +70,22 @@ _CG_TO_CMC_SLUG = {
     "solana":       "SOL",
 }
 
+# Deribit base URL (needed before cached_deribit_* definitions)
+DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
+
+
+def deribit_get(method, params=None):
+    """Generic Deribit public API — no auth needed for market data."""
+    try:
+        url = f"{DERIBIT_BASE}/{method}"
+        r = requests.get(url, params=params or {}, timeout=10)
+        data = r.json()
+        if data.get("result") is not None:
+            return data["result"]
+        return None
+    except Exception:
+        return None
+
 
 def _cg_get(url, timeout=8):
     """CoinGecko GET with API key header. Raises on non-200."""
@@ -139,6 +155,127 @@ def _fetch_coin_history(coin_id, ticker, days=90):
     # CMC fallback
     cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, ticker)
     return _cmc_history(cmc_sym, days)
+
+
+def _fetch_coin_market_data(coin_id):
+    """Fetch detailed market data (CoinGecko only)."""
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}?localization=false&tickers=false&community_data=true&developer_data=false"
+        r = _cg_get(url, timeout=10)
+        data = r.json()
+        md = data.get('market_data', {})
+        return {
+            'market_cap': md.get('market_cap', {}).get('usd'),
+            'volume_24h': md.get('total_volume', {}).get('usd'),
+            'price_change_7d': md.get('price_change_percentage_7d'),
+            'price_change_30d': md.get('price_change_percentage_30d'),
+            'ath': md.get('ath', {}).get('usd'),
+            'ath_change_pct': md.get('ath_change_percentage', {}).get('usd'),
+            'sentiment_up': data.get('sentiment_votes_up_percentage'),
+        }
+    except Exception:
+        return {}
+
+
+# ── Streamlit-native caches (shared across all users + reruns) ─────
+# These prevent redundant API calls that cause rate-limiting and
+# the "Tried to use SessionInfo before it was initialized" crash.
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_coin_price(coin_id, ticker):
+    return _fetch_coin_price(coin_id, ticker)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_coin_history(coin_id, ticker, days=90):
+    return _fetch_coin_history(coin_id, ticker, days)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_coin_market_data(coin_id):
+    return _fetch_coin_market_data(coin_id)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_fear_greed(days=30):
+    return _fetch_fear_greed_raw(days)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_deribit_index(currency):
+    """Deribit index price — Streamlit-cached."""
+    try:
+        result = deribit_get("get_index_price", {"index_name": f"{currency.lower()}_usd"})
+        return result.get("index_price") if result else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_deribit_book(currency):
+    """Deribit book summary — Streamlit-cached."""
+    try:
+        result = deribit_get("get_book_summary_by_currency", {
+            "currency": currency.upper(), "kind": "option"
+        })
+        return result or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_deribit_dvol(currency, days=30):
+    """Deribit DVOL history — Streamlit-cached."""
+    try:
+        result = deribit_get("get_volatility_index_data", {
+            "currency":        currency.upper(),
+            "start_timestamp": int((datetime.now() - timedelta(days=days)).timestamp() * 1000),
+            "end_timestamp":   int(datetime.now().timestamp() * 1000),
+            "resolution":      "3600"
+        })
+        if result and result.get("data"):
+            return [(row[0], row[4]) for row in result["data"]]
+        return None
+    except Exception:
+        return None
+
+
+def _api_health_check():
+    """Quick health check for all APIs. Returns dict of status bools."""
+    status = {}
+    # CoinGecko
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/ping",
+                         headers=_CG_HEADERS, timeout=3)
+        status["CoinGecko"] = r.status_code == 200
+    except Exception:
+        status["CoinGecko"] = False
+    # CoinMarketCap
+    try:
+        r = requests.get("https://pro-api.coinmarketcap.com/v1/key/info",
+                         headers=_CMC_HEADERS, timeout=3)
+        status["CMC"] = r.status_code == 200
+    except Exception:
+        status["CMC"] = False
+    # Deribit
+    try:
+        r = requests.get("https://www.deribit.com/api/v2/public/get_time", timeout=3)
+        status["Deribit"] = r.status_code == 200
+    except Exception:
+        status["Deribit"] = False
+    # Fear & Greed
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1&format=json",
+                         timeout=3, headers={'User-Agent': 'Mozilla/5.0'})
+        status["Fear&Greed"] = r.status_code == 200
+    except Exception:
+        status["Fear&Greed"] = False
+    return status
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_api_health():
+    return _api_health_check()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1284,11 +1421,20 @@ with st.sidebar:
     with _tb2:
         if st.button("🔄 Refresh Data", key="global_refresh", use_container_width=True):
             _cache_clear_all()
-            # Clear vol-surface session keys too
+            st.cache_data.clear()
             for k in list(st.session_state.keys()):
                 if k.startswith("vs_"):
                     del st.session_state[k]
             st.rerun()
+
+    # ── API Health ──────────────────────────────────────
+    _health = cached_api_health()
+    _health_html = " ".join(
+        f'<span style="color:{"#00e676" if ok else "#ff4b6e"};font-size:9px;">{"●" if ok else "○"} {name}</span>'
+        for name, ok in _health.items()
+    )
+    st.markdown(f'<div style="margin:4px 0 12px 0;line-height:1.6;">{_health_html}</div>', unsafe_allow_html=True)
+
     st.markdown(f'<div style="font-size:10px;color:#3d6080;letter-spacing:2px;margin-bottom:20px;">TRADE FINTECH · {st.session_state.get("active_token_ticker","XDC")} OPTIONS</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section-header">UNDERLYING</div>', unsafe_allow_html=True)
@@ -1306,8 +1452,7 @@ with st.sidebar:
     coin_id, token_ticker, token_default_price = TOKENS[token_choice]
 
     if coin_id is not None:
-        with st.spinner(f"Fetching {token_ticker} price..."):
-            live_price = _fetch_coin_price(coin_id, token_ticker)
+        live_price = cached_coin_price(coin_id, token_ticker)
         if live_price:
             st.success(f"Live {token_ticker}: ${live_price:,.4f}")
             spot = st.number_input("Spot Override ($)", value=float(live_price),
@@ -1335,8 +1480,7 @@ with st.sidebar:
         _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
         _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
         _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
-        with st.spinner("Fetching 90d history..."):
-            price_hist = _fetch_coin_history(_cid_vol, _ticker_vol, 90)
+        price_hist = cached_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist:
             hv_30 = historical_volatility(price_hist[-31:], 30)
             hv_90 = historical_volatility(price_hist, 90)
@@ -1352,8 +1496,7 @@ with st.sidebar:
         _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
         _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
         _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
-        with st.spinner("Fetching history..."):
-            price_hist = _fetch_coin_history(_cid_vol, _ticker_vol, 90)
+        price_hist = cached_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist and len(price_hist) > 5:
             log_rets = np.log(np.array(price_hist[1:]) / np.array(price_hist[:-1]))
             lam_ewma = 0.94
@@ -1392,27 +1535,14 @@ with st.sidebar:
 
     # ── CACHE STATUS ──────────────────────────────────────
     st.markdown('<div class="section-header">CACHE STATUS</div>', unsafe_allow_html=True)
-    _stats = cache_stats()
-    _active_caches = sum(1 for v in _stats.values() if v['alive'])
-    _total_caches = len(_stats)
+    _ss_stats = cache_stats()
+    _ss_active = sum(1 for v in _ss_stats.values() if v['alive'])
+    _ss_total  = len(_ss_stats)
+    st.caption(f"Session entries: {_ss_active}/{_ss_total} | Streamlit @cache_data: active")
 
-    if _total_caches > 0:
-        st.markdown(
-            f'<div style="font-size:10px;color:#5a7a99;line-height:1.8;">'
-            f'Active: <span style="color:#00e676">{_active_caches}</span> / {_total_caches} entries<br>'
-            + '<br>'.join(
-                f'<span style="color:{"#00e676" if v["alive"] else "#ff4b6e"}">{"●" if v["alive"] else "○"}</span> '
-                f'{k}: <span style="color:#5a9abf">{v["remaining_s"]}s</span>'
-                for k, v in sorted(_stats.items())[:8]
-            )
-            + '</div>',
-            unsafe_allow_html=True
-        )
-    else:
-        st.caption("No cached data yet")
-
-    if st.button("🗑️ Clear Cache", key="clear_cache_btn"):
+    if st.button("🗑️ Clear All Caches", key="clear_cache_btn"):
         _cache_clear_all()
+        st.cache_data.clear()
         st.rerun()
 
 
@@ -1457,20 +1587,6 @@ for K in strikes:
 # ─────────────────────────────────────────────────────────
 #  DERIBIT & VOL SURFACE FUNCTIONS
 # ─────────────────────────────────────────────────────────
-
-DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
-
-def deribit_get(method, params=None):
-    """Generic Deribit public API — no auth needed for market data."""
-    try:
-        url = f"{DERIBIT_BASE}/{method}"
-        r = requests.get(url, params=params or {}, timeout=10)
-        data = r.json()
-        if data.get("result") is not None:
-            return data["result"]
-        return None
-    except Exception:
-        return None
 
 def fetch_deribit_index(currency):
     """Cached Deribit index price (TTL: 2min)."""
@@ -2197,49 +2313,22 @@ with tab5:
         unsafe_allow_html=True
     )
 
-    # ── DATA LOADING ──
-    with st.spinner(f"Loading {st.session_state.get('active_token_ticker','XDC')} 180d + BTC + ETH + Fear & Greed..."):
-        _cid_md = st.session_state.get("active_coin_id", "xdc-network")
-        _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
-        _ticker_md = st.session_state.get("active_token_ticker", "XDC")
-        try:
-            url = f"https://api.coingecko.com/api/v3/coins/{_cid_md}/market_chart?vs_currency=usd&days=180&interval=daily"
-            r = _cg_get(url)
-            _mddata = r.json()
-            xdc_prices_ext = [p[1] for p in _mddata.get("prices", [])]
-            xdc_volumes    = [p[1] for p in _mddata.get("total_volumes", [])]
-            if len(xdc_prices_ext) < 5:
-                xdc_prices_ext, xdc_volumes = None, None
-        except Exception:
-            xdc_prices_ext, xdc_volumes = None, None
-        # CMC fallback for 180d history
-        if xdc_prices_ext is None:
-            _cmc_sym = _CG_TO_CMC_SLUG.get(_cid_md, _ticker_md)
-            _cmc_h = _cmc_history(_cmc_sym, 180)
-            if _cmc_h and len(_cmc_h) > 5:
-                xdc_prices_ext = _cmc_h
-                xdc_volumes = [1e6] * len(_cmc_h)
-        btc_prices  = fetch_btc_history(90)
-        eth_prices  = fetch_eth_history(90)
-        _cid_mkd = st.session_state.get("active_coin_id", "xdc-network")
-        _cid_mkd = _cid_mkd if _cid_mkd != "custom" else "xdc-network"
-        try:
-            _mkdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_mkd}?localization=false&tickers=false&community_data=true&developer_data=false"
-            _mkdr   = _cg_get(_mkdurl)
-            _mkdd   = _mkdr.json()
-            _mkdmd  = _mkdd.get("market_data", {})
-            mkt_data = {
-                "market_cap":     _mkdmd.get("market_cap", {}).get("usd"),
-                "volume_24h":     _mkdmd.get("total_volume", {}).get("usd"),
-                "price_change_7d":  _mkdmd.get("price_change_percentage_7d"),
-                "price_change_30d": _mkdmd.get("price_change_percentage_30d"),
-                "ath":            _mkdmd.get("ath", {}).get("usd"),
-                "ath_change_pct": _mkdmd.get("ath_change_percentage", {}).get("usd"),
-                "sentiment_up":   _mkdd.get("sentiment_votes_up_percentage"),
-            }
-        except Exception:
-            mkt_data = {}
-        fg_data     = fetch_fear_greed(30)
+    # ── DATA LOADING (all cached — no blocking on reruns) ──
+    _cid_md = st.session_state.get("active_coin_id", "xdc-network")
+    _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
+    _ticker_md = st.session_state.get("active_token_ticker", "XDC")
+
+    xdc_prices_ext = cached_coin_history(_cid_md, _ticker_md, 180)
+    xdc_volumes    = None  # volumes only from CoinGecko extended endpoint
+    if xdc_prices_ext is None:
+        xdc_volumes = None
+    else:
+        xdc_volumes = [1e6] * len(xdc_prices_ext)  # placeholder volumes
+
+    btc_prices  = cached_coin_history("bitcoin", "BTC", 90)
+    eth_prices  = cached_coin_history("ethereum", "ETH", 90)
+    mkt_data    = cached_coin_market_data(_cid_md)
+    fg_data     = cached_fear_greed(30)
 
     data_ok = xdc_prices_ext is not None and len(xdc_prices_ext) > 30
 
@@ -3578,56 +3667,22 @@ with tab9:
 
     refresh_btn = st.button("🔄  Refresh Live Data", key="vs_refresh")
 
-    # ── Cache data in session state ─────────────────────────────────
-    cache_key_book  = f"vs_book_{surface_asset}"
-    cache_key_index = f"vs_index_{surface_asset}"
-    cache_key_btc   = "vs_book_BTC"
-    cache_key_eth   = "vs_book_ETH"
-    cache_key_time  = "vs_last_fetch"
+    # All Deribit data now uses @st.cache_data — no manual session_state needed
+    if refresh_btn:
+        st.cache_data.clear()
 
-    needs_fetch = (
-        refresh_btn or
-        cache_key_book  not in st.session_state or
-        cache_key_index not in st.session_state
-    )
-
-    if needs_fetch:
-        with st.spinner(f"Fetching live Deribit data for {surface_asset}, BTC, ETH..."):
-            # Fetch primary asset
-            idx_price = fetch_deribit_index(surface_asset)
-            book_raw  = fetch_deribit_book_summary(surface_asset)
-            st.session_state[cache_key_index] = idx_price
-            st.session_state[cache_key_book]  = book_raw
-
-            # Always fetch BTC + ETH for XDC proxy
-            if surface_asset != "BTC":
-                btc_idx  = fetch_deribit_index("BTC")
-                btc_book = fetch_deribit_book_summary("BTC")
-                st.session_state["vs_index_BTC"] = btc_idx
-                st.session_state["vs_book_BTC"]  = btc_book
-            if surface_asset != "ETH":
-                eth_idx  = fetch_deribit_index("ETH")
-                eth_book = fetch_deribit_book_summary("ETH")
-                st.session_state["vs_index_ETH"] = eth_idx
-                st.session_state["vs_book_ETH"]  = eth_book
-
-            # DVOL history for BTC + ETH
-            st.session_state["vs_dvol_BTC"] = fetch_deribit_dvol_history("BTC", days=30)
-            st.session_state["vs_dvol_ETH"] = fetch_deribit_dvol_history("ETH", days=30)
-            st.session_state[cache_key_time] = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    idx_price = st.session_state.get(cache_key_index)
-    book_raw  = st.session_state.get(cache_key_book, [])
-    last_time = st.session_state.get(cache_key_time, "Not yet fetched")
+    idx_price = cached_deribit_index(surface_asset)
+    book_raw  = cached_deribit_book(surface_asset)
+    last_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # Parse
     df_surface = parse_book_summary(book_raw, idx_price)
 
     # BTC/ETH for XDC proxy
-    btc_idx  = st.session_state.get("vs_index_BTC") or fetch_deribit_index("BTC")
-    eth_idx  = st.session_state.get("vs_index_ETH") or fetch_deribit_index("ETH")
-    df_btc   = parse_book_summary(st.session_state.get("vs_book_BTC", []), btc_idx)
-    df_eth   = parse_book_summary(st.session_state.get("vs_book_ETH", []), eth_idx)
+    btc_idx  = cached_deribit_index("BTC")
+    eth_idx  = cached_deribit_index("ETH")
+    df_btc   = parse_book_summary(cached_deribit_book("BTC"), btc_idx)
+    df_eth   = parse_book_summary(cached_deribit_book("ETH"), eth_idx)
 
     # ── Live index prices banner ─────────────────────────────────────
     price_cols = st.columns(5)
@@ -3637,7 +3692,7 @@ with tab9:
         "XDC": (spot,    "#00d4ff"),
     }
     if surface_asset == "SOL":
-        sol_idx = st.session_state.get("vs_index_SOL") or fetch_deribit_index("SOL")
+        sol_idx = cached_deribit_index("SOL")
         prices_map["SOL"] = (sol_idx, "#00e676")
 
     for i, (asset, (px_val, col)) in enumerate(prices_map.items()):
@@ -3669,8 +3724,8 @@ with tab9:
     # ── DVOL History ─────────────────────────────────────────────────
     st.markdown('<div class="section-header" style="margin-top:20px;">DVOL INDEX — 30-DAY HISTORY (BTC & ETH)</div>', unsafe_allow_html=True)
 
-    dvol_btc = st.session_state.get("vs_dvol_BTC")
-    dvol_eth = st.session_state.get("vs_dvol_ETH")
+    dvol_btc = cached_deribit_dvol("BTC", 30)
+    dvol_eth = cached_deribit_dvol("ETH", 30)
 
     fig_dvol = go.Figure()
     if dvol_btc:
@@ -3914,16 +3969,11 @@ with tab9:
     _active_tok_vs = st.session_state.get("active_token_ticker", "XDC")
     st.markdown(f'<div class="section-header">{_active_tok_vs} HISTORICAL VOL ANALYSIS</div>', unsafe_allow_html=True)
 
-    # Fetch XDC historical data for vol computation
+    # Fetch historical data for vol computation (Streamlit-cached)
     _cid_vs = st.session_state.get("active_coin_id", "xdc-network")
     _cid_vs = _cid_vs if _cid_vs != "custom" else "xdc-network"
     _ticker_vs = st.session_state.get("active_token_ticker", "XDC")
-    _vs_hist_key = f"vs_hist_{_cid_vs}"
-    if _vs_hist_key not in st.session_state or refresh_btn:
-        _hist = _fetch_coin_history(_cid_vs, _ticker_vs, 365)
-        st.session_state[_vs_hist_key] = _hist if (_hist and len(_hist) > 5) else None
-
-    xdc_hist_prices = st.session_state.get(_vs_hist_key)
+    xdc_hist_prices = cached_coin_history(_cid_vs, _ticker_vs, 365)
 
     if xdc_hist_prices and len(xdc_hist_prices) > 30:
         xdc_log_rets_vs = np.log(np.array(xdc_hist_prices[1:]) / np.array(xdc_hist_prices[:-1]))
