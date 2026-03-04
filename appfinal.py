@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import requests
+import time as _time_mod
 
 # Supabase backend (optional — gracefully degrades if not configured)
 try:
@@ -23,6 +24,76 @@ from datetime import datetime, timedelta
 import warnings
 import math
 warnings.filterwarnings('ignore')
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CACHING LAYER
+#  TTL-based cache for all external API calls.
+#  Avoids redundant network requests across Streamlit reruns.
+#  Cache levels:
+#    1. @st.cache_data(ttl=...)  — cross-rerun, auto-expires
+#    2. session_state            — per-session persistence
+#    3. Supabase                 — cross-session (optional)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Cache TTL constants (seconds)
+CACHE_TTL_SPOT        = 60       # Live price: 1 minute
+CACHE_TTL_HISTORY     = 300      # Price history: 5 minutes
+CACHE_TTL_MARKET_DATA = 300      # Market cap, volume: 5 minutes
+CACHE_TTL_FEAR_GREED  = 600      # Fear & Greed: 10 minutes
+CACHE_TTL_DERIBIT     = 120      # Vol surface: 2 minutes
+CACHE_TTL_COMPUTATION = 600      # Heavy computations: 10 minutes
+
+
+def _cache_get(key):
+    """Read from session_state cache with TTL check."""
+    entry = st.session_state.get(f"_cache_{key}")
+    if entry is None:
+        return None
+    data, expiry = entry
+    if _time_mod.time() > expiry:
+        return None  # expired
+    return data
+
+
+def _cache_set(key, data, ttl):
+    """Write to session_state cache with TTL."""
+    st.session_state[f"_cache_{key}"] = (data, _time_mod.time() + ttl)
+
+
+def _cache_age(key):
+    """Return age of cache entry in seconds, or None if missing/expired."""
+    entry = st.session_state.get(f"_cache_{key}")
+    if entry is None:
+        return None
+    _, expiry = entry
+    ttl_remaining = expiry - _time_mod.time()
+    if ttl_remaining <= 0:
+        return None
+    # We don't store creation time, so approximate from remaining TTL
+    return ttl_remaining
+
+
+def _cache_clear_all():
+    """Clear all cache entries from session_state."""
+    keys_to_delete = [k for k in st.session_state if k.startswith("_cache_")]
+    for k in keys_to_delete:
+        del st.session_state[k]
+
+
+def cache_stats():
+    """Return summary of cached entries."""
+    entries = {}
+    for k, v in st.session_state.items():
+        if k.startswith("_cache_"):
+            clean_key = k[7:]  # strip _cache_ prefix
+            _, expiry = v
+            remaining = max(0, expiry - _time_mod.time())
+            entries[clean_key] = {
+                'remaining_s': int(remaining),
+                'alive': remaining > 0,
+            }
+    return entries
 # ─────────────────────────────────────────────
 #  CHART KEY COUNTER — unique key per plotly chart per run
 # ─────────────────────────────────────────────
@@ -369,8 +440,8 @@ def monte_carlo_price(S, K, T, r, sigma, option_type='call', n_sims=50000, seed=
     return price, std_err, S_T
 
 
-def fetch_xdc_price():
-    """Try to fetch XDC price from CoinGecko (free, no key needed)."""
+def _fetch_xdc_price_raw():
+    """Raw XDC price fetch from CoinGecko."""
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=xdc-network&vs_currencies=usd"
         r = requests.get(url, timeout=5)
@@ -380,8 +451,19 @@ def fetch_xdc_price():
         return None
 
 
-def fetch_xdc_history():
-    """Fetch 90d XDC price history from CoinGecko."""
+def fetch_xdc_price():
+    """Cached XDC price (TTL: 60s)."""
+    cached = _cache_get("xdc_price")
+    if cached is not None:
+        return cached
+    result = _fetch_xdc_price_raw()
+    if result is not None:
+        _cache_set("xdc_price", result, CACHE_TTL_SPOT)
+    return result
+
+
+def _fetch_xdc_history_raw():
+    """Raw 90d XDC history fetch."""
     try:
         url = "https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days=90&interval=daily"
         r = requests.get(url, timeout=8)
@@ -392,12 +474,23 @@ def fetch_xdc_history():
         return None
 
 
+def fetch_xdc_history():
+    """Cached 90d XDC history (TTL: 5min)."""
+    cached = _cache_get("xdc_history_90d")
+    if cached is not None:
+        return cached
+    result = _fetch_xdc_history_raw()
+    if result is not None:
+        _cache_set("xdc_history_90d", result, CACHE_TTL_HISTORY)
+    return result
+
+
 # ─────────────────────────────────────────────
 #  MARKET DYNAMICS — PROBABILITY DISTRIBUTION
 # ─────────────────────────────────────────────
 
-def fetch_eth_history(days=90):
-    """Fetch ETH history as second market proxy."""
+def _fetch_eth_history_raw(days=90):
+    """Raw ETH history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = requests.get(url, timeout=8)
@@ -406,12 +499,20 @@ def fetch_eth_history(days=90):
     except:
         return None
 
-def fetch_fear_greed(days=30):
-    """
-    Fetch Crypto Fear & Greed Index from alternative.me (free, no key).
-    Returns list of (timestamp, value, label) tuples, most recent first.
-    Scores: 0–24 Extreme Fear, 25–49 Fear, 50–74 Greed, 75–100 Extreme Greed.
-    """
+
+def fetch_eth_history(days=90):
+    """Cached ETH history (TTL: 5min)."""
+    cache_key = f"eth_history_{days}d"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = _fetch_eth_history_raw(days)
+    if result is not None:
+        _cache_set(cache_key, result, CACHE_TTL_HISTORY)
+    return result
+
+def _fetch_fear_greed_raw(days=30):
+    """Raw Fear & Greed fetch."""
     try:
         url = f"https://api.alternative.me/fng/?limit={days}&format=json"
         r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
@@ -431,8 +532,20 @@ def fetch_fear_greed(days=30):
     except Exception:
         return None
 
-def fetch_btc_history(days=90):
-    """Fetch BTC history as market proxy for risk-on/risk-off."""
+
+def fetch_fear_greed(days=30):
+    """Cached Fear & Greed (TTL: 10min)."""
+    cache_key = f"fear_greed_{days}d"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = _fetch_fear_greed_raw(days)
+    if result is not None:
+        _cache_set(cache_key, result, CACHE_TTL_FEAR_GREED)
+    return result
+
+def _fetch_btc_history_raw(days=90):
+    """Raw BTC history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = requests.get(url, timeout=8)
@@ -441,8 +554,20 @@ def fetch_btc_history(days=90):
     except:
         return None
 
-def fetch_xdc_extended(days=180):
-    """Fetch extended XDC history for regime detection."""
+
+def fetch_btc_history(days=90):
+    """Cached BTC history (TTL: 5min)."""
+    cache_key = f"btc_history_{days}d"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = _fetch_btc_history_raw(days)
+    if result is not None:
+        _cache_set(cache_key, result, CACHE_TTL_HISTORY)
+    return result
+
+def _fetch_xdc_extended_raw(days=180):
+    """Raw extended XDC history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = requests.get(url, timeout=8)
@@ -453,8 +578,20 @@ def fetch_xdc_extended(days=180):
     except:
         return None, None
 
-def fetch_xdc_market_data():
-    """Fetch market cap, volume, sentiment proxies."""
+
+def fetch_xdc_extended(days=180):
+    """Cached extended XDC history (TTL: 5min)."""
+    cache_key = f"xdc_extended_{days}d"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = _fetch_xdc_extended_raw(days)
+    if result[0] is not None:
+        _cache_set(cache_key, result, CACHE_TTL_HISTORY)
+    return result
+
+def _fetch_xdc_market_data_raw():
+    """Raw XDC market data fetch."""
     try:
         url = "https://api.coingecko.com/api/v3/coins/xdc-network?localization=false&tickers=false&community_data=true&developer_data=false"
         r = requests.get(url, timeout=8)
@@ -471,7 +608,19 @@ def fetch_xdc_market_data():
             'sentiment_up': sentiment,
         }
     except:
-        return {}
+        return None
+
+
+def fetch_xdc_market_data():
+    """Cached XDC market data (TTL: 5min)."""
+    cached = _cache_get("xdc_market_data")
+    if cached is not None:
+        return cached
+    result = _fetch_xdc_market_data_raw()
+    if result is not None:
+        _cache_set("xdc_market_data", result, CACHE_TTL_MARKET_DATA)
+        return result
+    return {}
 
 def compute_log_returns(prices):
     p = np.array(prices)
@@ -1160,6 +1309,31 @@ with st.sidebar:
 
     # Snowball params moved to Structures tab (tab4)
 
+    # ── CACHE STATUS ──────────────────────────────────────
+    st.markdown('<div class="section-header">CACHE STATUS</div>', unsafe_allow_html=True)
+    _stats = cache_stats()
+    _active_caches = sum(1 for v in _stats.values() if v['alive'])
+    _total_caches = len(_stats)
+
+    if _total_caches > 0:
+        st.markdown(
+            f'<div style="font-size:10px;color:#5a7a99;line-height:1.8;">'
+            f'Active: <span style="color:#00e676">{_active_caches}</span> / {_total_caches} entries<br>'
+            + '<br>'.join(
+                f'<span style="color:{"#00e676" if v["alive"] else "#ff4b6e"}">{"●" if v["alive"] else "○"}</span> '
+                f'{k}: <span style="color:#5a9abf">{v["remaining_s"]}s</span>'
+                for k, v in sorted(_stats.items())[:8]
+            )
+            + '</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.caption("No cached data yet")
+
+    if st.button("🗑️ Clear Cache", key="clear_cache_btn"):
+        _cache_clear_all()
+        st.rerun()
+
 
 # ─────────────────────────────────────────────
 #  MAIN CONTENT
@@ -1218,19 +1392,37 @@ def deribit_get(method, params=None):
         return None
 
 def fetch_deribit_index(currency):
-    """Fetch live index price for BTC, ETH, SOL."""
+    """Cached Deribit index price (TTL: 2min)."""
+    cache_key = f"deribit_idx_{currency}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     result = deribit_get("get_index_price", {"index_name": f"{currency.lower()}_usd"})
-    return result.get("index_price") if result else None
+    val = result.get("index_price") if result else None
+    if val is not None:
+        _cache_set(cache_key, val, CACHE_TTL_DERIBIT)
+    return val
 
 def fetch_deribit_book_summary(currency):
-    """Fetch book summary for all options — includes mark_iv, bid_iv, ask_iv, greeks."""
+    """Cached Deribit book summary (TTL: 2min)."""
+    cache_key = f"deribit_book_{currency}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     result = deribit_get("get_book_summary_by_currency", {
         "currency": currency.upper(), "kind": "option"
     })
-    return result or []
+    val = result or []
+    if val:
+        _cache_set(cache_key, val, CACHE_TTL_DERIBIT)
+    return val
 
 def fetch_deribit_dvol_history(currency, days=30):
-    """Fetch DVOL (30d forward vol index) hourly history."""
+    """Cached DVOL history (TTL: 10min)."""
+    cache_key = f"deribit_dvol_{currency}_{days}d"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         result = deribit_get("get_volatility_index_data", {
             "currency":        currency.upper(),
@@ -1239,14 +1431,23 @@ def fetch_deribit_dvol_history(currency, days=30):
             "resolution":      "3600"
         })
         if result and result.get("data"):
-            return [(row[0], row[4]) for row in result["data"]]  # (timestamp, close)
+            val = [(row[0], row[4]) for row in result["data"]]  # (timestamp, close)
+            _cache_set(cache_key, val, CACHE_TTL_COMPUTATION)
+            return val
         return None
     except Exception:
         return None
 
 def fetch_deribit_ticker(instrument_name):
-    """Fetch single instrument ticker."""
-    return deribit_get("get_ticker", {"instrument_name": instrument_name})
+    """Cached Deribit ticker (TTL: 2min)."""
+    cache_key = f"deribit_tick_{instrument_name}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    result = deribit_get("get_ticker", {"instrument_name": instrument_name})
+    if result is not None:
+        _cache_set(cache_key, result, CACHE_TTL_DERIBIT)
+    return result
 
 def parse_book_summary(book_data, index_price):
     """Parse raw book summary into structured vol surface DataFrame."""
