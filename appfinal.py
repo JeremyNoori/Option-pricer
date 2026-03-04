@@ -2665,43 +2665,55 @@ with tab5:
     st.markdown('<div class="section-header">30-DAY PRICE PROBABILITY DENSITY — ALL MODELS</div>', unsafe_allow_html=True)
 
     fig_dist = go.Figure()
-    price_range = np.linspace(spot * 0.10, spot * 3.5, 600)
+    price_range = np.linspace(spot * 0.50, spot * 2.5, 800)
+    _tok_label = st.session_state.get("active_token_ticker", "XDC")
 
-    for model_name, sims in distributions.items():
+    # Add non-ensemble models first (background), then ensemble on top
+    _sorted_models = sorted(distributions.keys(), key=lambda m: (m == 'Ensemble (Blended)',))
+    for model_name in _sorted_models:
+        sims = distributions[model_name]
         try:
             kde = gaussian_kde(sims, bw_method='scott')
             density = kde(price_range)
             is_ens = model_name == 'Ensemble (Blended)'
+            _mc = model_colors.get(model_name, '#aaa')
+            # Convert hex to rgba for fill
+            _r, _g, _b = int(_mc[1:3], 16), int(_mc[3:5], 16), int(_mc[5:7], 16)
             fig_dist.add_trace(go.Scatter(
                 x=price_range, y=density, name=model_name,
                 line=dict(
-                    color=model_colors.get(model_name, '#aaa'),
-                    width=3.5 if is_ens else 1.5,
-                    dash='solid' if is_ens else 'dot'
+                    color=_mc,
+                    width=3.5 if is_ens else 2.0,
+                    dash='solid' if is_ens else 'dot',
+                    shape='spline',
                 ),
-                fill='tozeroy' if is_ens else 'none',
-                fillcolor='rgba(0,212,255,0.06)' if is_ens else None,
-                opacity=1.0 if is_ens else 0.75,
+                fill='tozeroy',
+                fillcolor=f'rgba({_r},{_g},{_b},0.10)' if is_ens else f'rgba({_r},{_g},{_b},0.03)',
+                opacity=1.0 if is_ens else 0.8,
                 hovertemplate=f"<b>{model_name}</b><br>Price: $%{{x:.5f}}<br>Density: %{{y:.4f}}<extra></extra>"
             ))
         except Exception:
             pass
 
-    for label, price, color in [
-        ("SPOT", spot, '#ffffff'), ("+50%", spot*1.50, '#00e676'),
-        ("+30%", spot*1.30, '#44cc77'), ("-30%", spot*0.70, '#ff6688'),
-        ("-50%", spot*0.50, '#ff4b6e'),
+    for label, price, color, lw in [
+        ("SPOT", spot, '#ffffff', 1.5), ("+50%", spot*1.50, '#00e676', 1),
+        ("+30%", spot*1.30, '#44cc77', 1), ("-30%", spot*0.70, '#ff6688', 1),
+        ("-50%", spot*0.50, '#ff4b6e', 1),
     ]:
-        fig_dist.add_vline(x=price, line_color=color, line_dash='dash', line_width=1,
-                           annotation_text=label, annotation_font_color=color, annotation_font_size=10)
+        fig_dist.add_vline(x=price, line_color=color, line_dash='dash', line_width=lw,
+                           annotation_text=label, annotation_font_color=color, annotation_font_size=11)
 
     fig_dist.update_layout(
         plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-        font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
-        xaxis=dict(gridcolor=_PLT_GRID, title='XDC Price at Day 30 ($)', tickformat='.5f'),
-        yaxis=dict(gridcolor=_PLT_GRID, title='Probability Density'),
-        legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR, font=dict(size=10)),
-        height=440, margin=dict(t=20, b=50), hovermode='x unified'
+        font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=11),
+        xaxis=dict(gridcolor=_PLT_GRID, title=f'{_tok_label} Price at Day 30 ($)',
+                   tickformat='.5f', zeroline=False, showgrid=True,
+                   gridwidth=1, minor=dict(gridcolor='rgba(58,90,120,0.15)', gridwidth=1)),
+        yaxis=dict(gridcolor=_PLT_GRID, title='Probability Density',
+                   zeroline=False, showgrid=True, gridwidth=1),
+        legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR, font=dict(size=11),
+                    orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+        height=540, margin=dict(t=50, b=60, l=60, r=30), hovermode='x unified'
     )
     st.plotly_chart(fig_dist, use_container_width=True, key=_next_chart_key())
 
@@ -2945,24 +2957,40 @@ with tab5:
     # ── RETURN HISTOGRAM ──
     st.markdown('<div class="section-header">30D RETURN HISTOGRAM — ALL MODELS OVERLAID</div>', unsafe_allow_html=True)
     fig_ret = go.Figure()
-    for model_name, sims in distributions.items():
+    # Draw non-ensemble first, ensemble last so it layers on top
+    _sorted_ret = sorted(distributions.keys(), key=lambda m: (m == 'Ensemble (Blended)',))
+    for model_name in _sorted_ret:
+        sims = distributions[model_name]
         returns_pct = (sims / spot - 1) * 100
+        is_ens = model_name == 'Ensemble (Blended)'
+        _mc = model_colors.get(model_name, '#888')
+        _r, _g, _b = int(_mc[1:3], 16), int(_mc[3:5], 16), int(_mc[5:7], 16)
         fig_ret.add_trace(go.Histogram(
-            x=returns_pct, nbinsx=100, name=model_name,
-            marker_color=model_colors.get(model_name, '#888'),
-            opacity=0.45 if model_name != 'Ensemble (Blended)' else 0.80,
+            x=returns_pct, nbinsx=120, name=model_name,
+            marker=dict(
+                color=f'rgba({_r},{_g},{_b},0.55)' if is_ens else f'rgba({_r},{_g},{_b},0.25)',
+                line=dict(color=_mc, width=1.0 if is_ens else 0.5),
+            ),
+            opacity=0.85 if is_ens else 0.50,
             histnorm='probability density'
         ))
-    fig_ret.add_vline(x=0,    line_color='#ffffff', line_dash='dot', annotation_text='0%')
-    fig_ret.add_vline(x=30,   line_color='#00e676', line_dash='dash', annotation_text='+30%')
-    fig_ret.add_vline(x=-30,  line_color='#ff4b6e', line_dash='dash', annotation_text='-30%')
+    fig_ret.add_vline(x=0,    line_color='#ffffff', line_dash='dot', line_width=1.5,
+                      annotation_text='0%', annotation_font_size=11, annotation_font_color='#ffffff')
+    fig_ret.add_vline(x=30,   line_color='#00e676', line_dash='dash', line_width=1,
+                      annotation_text='+30%', annotation_font_size=10, annotation_font_color='#00e676')
+    fig_ret.add_vline(x=-30,  line_color='#ff4b6e', line_dash='dash', line_width=1,
+                      annotation_text='-30%', annotation_font_size=10, annotation_font_color='#ff4b6e')
     fig_ret.update_layout(
         barmode='overlay', plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-        font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
-        xaxis=dict(gridcolor=_PLT_GRID, title='30-Day Return (%)', range=[-100, 250]),
-        yaxis=dict(gridcolor=_PLT_GRID, title='Probability Density'),
-        legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR),
-        height=360, margin=dict(t=20, b=50)
+        font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=11),
+        xaxis=dict(gridcolor=_PLT_GRID, title='30-Day Return (%)', range=[-100, 250],
+                   zeroline=False, showgrid=True, gridwidth=1,
+                   minor=dict(gridcolor='rgba(58,90,120,0.15)', gridwidth=1)),
+        yaxis=dict(gridcolor=_PLT_GRID, title='Probability Density',
+                   zeroline=False, showgrid=True, gridwidth=1),
+        legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR, font=dict(size=11),
+                    orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+        height=480, margin=dict(t=50, b=60, l=60, r=30)
     )
     st.plotly_chart(fig_ret, use_container_width=True, key=_next_chart_key())
 
@@ -3727,12 +3755,12 @@ with tab9:
     # ── Controls ────────────────────────────────────────────────────
     ctrl_cols = st.columns([2, 2, 2, 3])
     with ctrl_cols[0]:
-        # Default to sidebar token if it has a Deribit surface (BTC/ETH/SOL)
+        # Default to sidebar token if it has a Deribit surface (BTC/ETH/SOL) or XDC proxy
         _sidebar_tok = st.session_state.get("active_token_ticker", "BTC")
-        _deribit_tokens = ["BTC", "ETH", "SOL"]
-        _default_vs = _sidebar_tok if _sidebar_tok in _deribit_tokens else "BTC"
-        surface_asset = st.selectbox("Primary Asset", _deribit_tokens,
-                                     index=_deribit_tokens.index(_default_vs), key="vs_asset")
+        _surface_tokens = ["BTC", "ETH", "SOL", "XDC"]
+        _default_vs = _sidebar_tok if _sidebar_tok in _surface_tokens else "BTC"
+        surface_asset = st.selectbox("Primary Asset", _surface_tokens,
+                                     index=_surface_tokens.index(_default_vs), key="vs_asset")
     with ctrl_cols[1]:
         iv_col_choice = st.selectbox("IV Type", ["mark_iv", "mid_iv", "bid_iv", "ask_iv"], key="vs_ivcol")
     with ctrl_cols[2]:
@@ -3741,14 +3769,18 @@ with tab9:
         xdc_T_days_vs   = st.slider("XDC Tenor for IV Proxy (days)", 7, 180, 30, key="vs_xdcT")
         xdc_moneyness_vs = st.slider("XDC Moneyness for IV Proxy", 0.5, 2.0, 1.0, 0.05, key="vs_xdcmon")
 
+    # ── XDC uses BTC/ETH proxy — override surface_asset for Deribit calls ──
+    _is_xdc_surface = (surface_asset == "XDC")
+    _deribit_asset  = "BTC" if _is_xdc_surface else surface_asset
+
     refresh_btn = st.button("🔄  Refresh Live Data", key="vs_refresh")
 
     # All Deribit data now uses @st.cache_data — no manual session_state needed
     if refresh_btn:
         st.cache_data.clear()
 
-    idx_price = cached_deribit_index(surface_asset)
-    book_raw  = cached_deribit_book(surface_asset)
+    idx_price = cached_deribit_index(_deribit_asset)
+    book_raw  = cached_deribit_book(_deribit_asset)
     last_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     # Parse
@@ -3835,7 +3867,10 @@ with tab9:
         st.info("DVOL history unavailable — Deribit may be rate-limiting. Try Refresh.")
 
     # ── 3D VOL SURFACE ────────────────────────────────────────────────
-    st.markdown(f'<div class="section-header">{surface_asset} VOLATILITY SURFACE — 3D</div>', unsafe_allow_html=True)
+    if _is_xdc_surface:
+        st.info("XDC has no listed options on Deribit. Showing BTC surface as reference — "
+                "scroll down for the XDC proxy IV curve with illiquidity premium applied.")
+    st.markdown(f'<div class="section-header">{surface_asset} VOLATILITY SURFACE — 3D{"  (BTC REFERENCE)" if _is_xdc_surface else ""}</div>', unsafe_allow_html=True)
 
     # Build surface grid
     df_for_surface = df_surface[df_surface[iv_col_choice].notna()].copy()
