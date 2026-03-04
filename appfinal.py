@@ -2299,9 +2299,8 @@ with tab4:
                 )
                 st.plotly_chart(fig_hm, use_container_width=True, key=_next_chart_key())
 
-        # Best structure highlight
-        best_idx = mc_exp_df['_mean_raw'].idxmax()
-        best = mc_exp_df.iloc[best_idx]
+        # Best structure highlight (df already sorted by _mean_raw desc)
+        best = mc_exp_df.iloc[0]
         st.markdown(f'''
         <div class="recommendation-box" style="border-left-color:#00e676">
             <div style="font-family:Space Mono;font-size:14px;color:#00e676;margin-bottom:6px;">OPTIMAL SNOWBALL STRUCTURE</div>
