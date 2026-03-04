@@ -1,4 +1,15 @@
 import streamlit as st
+
+# ─────────────────────────────────────────────
+#  PAGE CONFIG — MUST be the first Streamlit command
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="OTC Options Pricer",
+    page_icon="⬡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm, t as student_t, gaussian_kde, skewnorm, genextreme
@@ -9,34 +20,27 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import requests
 import time as _time_mod
-
-# Supabase backend (optional — gracefully degrades if not configured)
-# NOTE: Do NOT call get_supabase_client() at import time — st.secrets
-# is unavailable before the Streamlit runtime initialises, causing
-# "Tried to use SessionInfo before it was initialized".
-try:
-    from supabase_config import (
-        get_supabase_client, save_quote, save_vol_snapshot,
-        save_strategy_result, load_quotes, load_vol_history
-    )
-    _SUPABASE_IMPORTS_OK = True
-except ImportError:
-    _SUPABASE_IMPORTS_OK = False
-
-
-def _is_supabase_available():
-    """Lazy check — only probes Supabase after Streamlit is running."""
-    if not _SUPABASE_IMPORTS_OK:
-        return False
-    try:
-        return get_supabase_client() is not None
-    except Exception:
-        return False
 import json
 from datetime import datetime, timedelta
 import warnings
 import math
 warnings.filterwarnings('ignore')
+
+# Supabase backend (optional — loaded lazily to avoid SessionInfo errors)
+_SUPABASE_IMPORTS_OK = False
+
+def _is_supabase_available():
+    """Lazy check — imports supabase_config on first call."""
+    global _SUPABASE_IMPORTS_OK
+    if _SUPABASE_IMPORTS_OK is None:
+        return False
+    try:
+        from supabase_config import get_supabase_client
+        _SUPABASE_IMPORTS_OK = True
+        return get_supabase_client() is not None
+    except Exception:
+        _SUPABASE_IMPORTS_OK = None  # don't retry
+        return False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -68,8 +72,10 @@ _CG_TO_CMC_SLUG = {
 
 
 def _cg_get(url, timeout=8):
-    """CoinGecko GET with API key header."""
-    return requests.get(url, headers=_CG_HEADERS, timeout=timeout)
+    """CoinGecko GET with API key header. Raises on non-200."""
+    r = requests.get(url, headers=_CG_HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r
 
 
 def _cmc_price(symbol):
@@ -83,6 +89,56 @@ def _cmc_price(symbol):
         return data["data"][symbol.upper()]["quote"]["USD"]["price"]
     except Exception:
         return None
+
+
+def _cmc_history(symbol, days=90):
+    """Fallback: fetch daily OHLCV history from CoinMarketCap."""
+    try:
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/historical"
+        r = requests.get(url, headers=_CMC_HEADERS,
+                         params={
+                             "symbol": symbol.upper(),
+                             "convert": "USD",
+                             "count": str(days),
+                             "interval": "daily",
+                         }, timeout=12)
+        data = r.json()
+        quotes = data["data"]["quotes"]
+        return [q["quote"]["USD"]["close"] for q in quotes]
+    except Exception:
+        return None
+
+
+def _fetch_coin_price(coin_id, ticker):
+    """Fetch live price: CoinGecko first, CMC fallback."""
+    # CoinGecko
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        r = _cg_get(url, timeout=5)
+        price = r.json().get(coin_id, {}).get("usd", None)
+        if price is not None:
+            return price
+    except Exception:
+        pass
+    # CMC fallback
+    cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, ticker)
+    return _cmc_price(cmc_sym)
+
+
+def _fetch_coin_history(coin_id, ticker, days=90):
+    """Fetch price history: CoinGecko first, CMC fallback."""
+    # CoinGecko
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}&interval=daily"
+        r = _cg_get(url)
+        prices = [p[1] for p in r.json().get("prices", [])]
+        if len(prices) > 5:
+            return prices
+    except Exception:
+        pass
+    # CMC fallback
+    cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, ticker)
+    return _cmc_history(cmc_sym, days)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -163,16 +219,6 @@ def _next_chart_key():
     return f"ck_{_chart_key_counter[0]}"
 
 
-
-# ─────────────────────────────────────────────
-#  PAGE CONFIG
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="OTC Options Pricer",
-    page_icon="⬡",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # ─────────────────────────────────────────────
 #  CUSTOM CSS — dark industrial / quantitative
@@ -500,17 +546,8 @@ def monte_carlo_price(S, K, T, r, sigma, option_type='call', n_sims=50000, seed=
 
 
 def _fetch_xdc_price_raw():
-    """Raw XDC price fetch from CoinGecko, CMC fallback."""
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=xdc-network&vs_currencies=usd"
-        r = _cg_get(url, timeout=5)
-        price = r.json().get('xdc-network', {}).get('usd', None)
-        if price is not None:
-            return price
-    except Exception:
-        pass
-    # Fallback to CoinMarketCap
-    return _cmc_price("XDC")
+    """Raw XDC price fetch with CMC fallback."""
+    return _fetch_coin_price("xdc-network", "XDC")
 
 
 def fetch_xdc_price():
@@ -525,15 +562,8 @@ def fetch_xdc_price():
 
 
 def _fetch_xdc_history_raw():
-    """Raw 90d XDC history fetch."""
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days=90&interval=daily"
-        r = _cg_get(url)
-        data = r.json()
-        prices = [p[1] for p in data.get('prices', [])]
-        return prices if len(prices) > 5 else None
-    except:
-        return None
+    """Raw 90d XDC history fetch with CMC fallback."""
+    return _fetch_coin_history("xdc-network", "XDC", 90)
 
 
 def fetch_xdc_history():
@@ -552,14 +582,8 @@ def fetch_xdc_history():
 # ─────────────────────────────────────────────
 
 def _fetch_eth_history_raw(days=90):
-    """Raw ETH history fetch."""
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = _cg_get(url)
-        data = r.json()
-        return [p[1] for p in data.get('prices', [])]
-    except:
-        return None
+    """Raw ETH history fetch with CMC fallback."""
+    return _fetch_coin_history("ethereum", "ETH", days)
 
 
 def fetch_eth_history(days=90):
@@ -607,14 +631,8 @@ def fetch_fear_greed(days=30):
     return result
 
 def _fetch_btc_history_raw(days=90):
-    """Raw BTC history fetch."""
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = _cg_get(url)
-        data = r.json()
-        return [p[1] for p in data.get('prices', [])]
-    except:
-        return None
+    """Raw BTC history fetch with CMC fallback."""
+    return _fetch_coin_history("bitcoin", "BTC", days)
 
 
 def fetch_btc_history(days=90):
@@ -629,16 +647,22 @@ def fetch_btc_history(days=90):
     return result
 
 def _fetch_xdc_extended_raw(days=180):
-    """Raw extended XDC history fetch."""
+    """Raw extended XDC history + volumes fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = _cg_get(url)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
         volumes = [p[1] for p in data.get('total_volumes', [])]
-        return prices, volumes
-    except:
-        return None, None
+        if len(prices) > 5:
+            return prices, volumes
+    except Exception:
+        pass
+    # CMC fallback (prices only, synthesise flat volumes)
+    prices = _cmc_history("XDC", days)
+    if prices and len(prices) > 5:
+        return prices, [1e6] * len(prices)
+    return None, None
 
 
 def fetch_xdc_extended(days=180):
@@ -653,10 +677,10 @@ def fetch_xdc_extended(days=180):
     return result
 
 def _fetch_xdc_market_data_raw():
-    """Raw XDC market data fetch."""
+    """Raw XDC market data fetch (CoinGecko only — no CMC equivalent)."""
     try:
         url = "https://api.coingecko.com/api/v3/coins/xdc-network?localization=false&tickers=false&community_data=true&developer_data=false"
-        r = _cg_get(url)
+        r = _cg_get(url, timeout=10)
         data = r.json()
         md = data.get('market_data', {})
         sentiment = data.get('sentiment_votes_up_percentage', None)
@@ -1248,13 +1272,23 @@ def recommend_structure(hv, spot, call_prices, put_prices, strikes, T):
 with st.sidebar:
     st.markdown('<div style="font-family:Space Mono;font-size:18px;color:#00d4ff;letter-spacing:2px;padding:10px 0;">⬡ OTC PRICER</div>', unsafe_allow_html=True)
 
-    # ── Theme toggle ──────────────────────────────────────
+    # ── Theme toggle + Refresh ──────────────────────────────
     if 'dark_mode' not in st.session_state:
         st.session_state['dark_mode'] = True
-    _mode_label = "🌙 Dark Mode" if st.session_state['dark_mode'] else "☀️ Light Mode"
-    if st.button(_mode_label, key="theme_toggle"):
-        st.session_state['dark_mode'] = not st.session_state['dark_mode']
-        st.rerun()
+    _tb1, _tb2 = st.columns(2)
+    with _tb1:
+        _mode_label = "🌙 Dark" if st.session_state['dark_mode'] else "☀️ Light"
+        if st.button(_mode_label, key="theme_toggle", use_container_width=True):
+            st.session_state['dark_mode'] = not st.session_state['dark_mode']
+            st.rerun()
+    with _tb2:
+        if st.button("🔄 Refresh Data", key="global_refresh", use_container_width=True):
+            _cache_clear_all()
+            # Clear vol-surface session keys too
+            for k in list(st.session_state.keys()):
+                if k.startswith("vs_"):
+                    del st.session_state[k]
+            st.rerun()
     st.markdown(f'<div style="font-size:10px;color:#3d6080;letter-spacing:2px;margin-bottom:20px;">TRADE FINTECH · {st.session_state.get("active_token_ticker","XDC")} OPTIONS</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="section-header">UNDERLYING</div>', unsafe_allow_html=True)
@@ -1273,18 +1307,7 @@ with st.sidebar:
 
     if coin_id is not None:
         with st.spinner(f"Fetching {token_ticker} price..."):
-            live_price = None
-            # Try CoinGecko (with API key)
-            try:
-                _url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-                _r = _cg_get(_url, timeout=5)
-                live_price = _r.json().get(coin_id, {}).get("usd", None)
-            except Exception:
-                pass
-            # Fallback: CoinMarketCap
-            if live_price is None:
-                _cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, token_ticker)
-                live_price = _cmc_price(_cmc_sym)
+            live_price = _fetch_coin_price(coin_id, token_ticker)
         if live_price:
             st.success(f"Live {token_ticker}: ${live_price:,.4f}")
             spot = st.number_input("Spot Override ($)", value=float(live_price),
@@ -1311,14 +1334,9 @@ with st.sidebar:
     elif "Auto from" in vol_mode:
         _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
         _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
+        _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
         with st.spinner("Fetching 90d history..."):
-            try:
-                _vurl = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
-                _vr   = _cg_get(_vurl)
-                price_hist = [p[1] for p in _vr.json().get("prices", [])]
-                price_hist = price_hist if len(price_hist) > 5 else None
-            except Exception:
-                price_hist = None
+            price_hist = _fetch_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist:
             hv_30 = historical_volatility(price_hist[-31:], 30)
             hv_90 = historical_volatility(price_hist, 90)
@@ -1333,14 +1351,9 @@ with st.sidebar:
     else:  # EWMA
         _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
         _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
+        _ticker_vol = st.session_state.get("active_token_ticker", "XDC")
         with st.spinner("Fetching history..."):
-            try:
-                _vurl2   = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
-                _vr2     = _cg_get(_vurl2)
-                price_hist = [p[1] for p in _vr2.json().get("prices", [])]
-                price_hist = price_hist if len(price_hist) > 5 else None
-            except Exception:
-                price_hist = None
+            price_hist = _fetch_coin_history(_cid_vol, _ticker_vol, 90)
         if price_hist and len(price_hist) > 5:
             log_rets = np.log(np.array(price_hist[1:]) / np.array(price_hist[:-1]))
             lam_ewma = 0.94
@@ -2188,15 +2201,24 @@ with tab5:
     with st.spinner(f"Loading {st.session_state.get('active_token_ticker','XDC')} 180d + BTC + ETH + Fear & Greed..."):
         _cid_md = st.session_state.get("active_coin_id", "xdc-network")
         _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
+        _ticker_md = st.session_state.get("active_token_ticker", "XDC")
         try:
-            _mdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_md}/market_chart?vs_currency=usd&days=180&interval=daily"
-            _mdr   = _cg_get(_mdurl)
-            _mddata = _mdr.json()
+            url = f"https://api.coingecko.com/api/v3/coins/{_cid_md}/market_chart?vs_currency=usd&days=180&interval=daily"
+            r = _cg_get(url)
+            _mddata = r.json()
             xdc_prices_ext = [p[1] for p in _mddata.get("prices", [])]
             xdc_volumes    = [p[1] for p in _mddata.get("total_volumes", [])]
-            if len(xdc_prices_ext) < 5: xdc_prices_ext, xdc_volumes = None, None
+            if len(xdc_prices_ext) < 5:
+                xdc_prices_ext, xdc_volumes = None, None
         except Exception:
             xdc_prices_ext, xdc_volumes = None, None
+        # CMC fallback for 180d history
+        if xdc_prices_ext is None:
+            _cmc_sym = _CG_TO_CMC_SLUG.get(_cid_md, _ticker_md)
+            _cmc_h = _cmc_history(_cmc_sym, 180)
+            if _cmc_h and len(_cmc_h) > 5:
+                xdc_prices_ext = _cmc_h
+                xdc_volumes = [1e6] * len(_cmc_h)
         btc_prices  = fetch_btc_history(90)
         eth_prices  = fetch_eth_history(90)
         _cid_mkd = st.session_state.get("active_coin_id", "xdc-network")
@@ -3895,15 +3917,11 @@ with tab9:
     # Fetch XDC historical data for vol computation
     _cid_vs = st.session_state.get("active_coin_id", "xdc-network")
     _cid_vs = _cid_vs if _cid_vs != "custom" else "xdc-network"
+    _ticker_vs = st.session_state.get("active_token_ticker", "XDC")
     _vs_hist_key = f"vs_hist_{_cid_vs}"
     if _vs_hist_key not in st.session_state or refresh_btn:
-        try:
-            _vs_hist_url = f"https://api.coingecko.com/api/v3/coins/{_cid_vs}/market_chart?vs_currency=usd&days=365&interval=daily"
-            _vs_hist_r = _cg_get(_vs_hist_url, timeout=10)
-            _vs_hist_data = _vs_hist_r.json()
-            st.session_state[_vs_hist_key] = [p[1] for p in _vs_hist_data.get("prices", [])]
-        except Exception:
-            st.session_state[_vs_hist_key] = None
+        _hist = _fetch_coin_history(_cid_vs, _ticker_vs, 365)
+        st.session_state[_vs_hist_key] = _hist if (_hist and len(_hist) > 5) else None
 
     xdc_hist_prices = st.session_state.get(_vs_hist_key)
 
