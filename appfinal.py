@@ -4606,6 +4606,7 @@ STRATEGY_DEPOSITORY = {
 }
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def score_strategies(view, confidence, hv, pcr, T_days, spot, sigma, is_otc_ok=True):
     """
     Score all strategies 0–100 based on:
@@ -4804,607 +4805,611 @@ def build_strategy_payoff(strat_name, strat_def, S, sigma, T, r, n_points=300):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab10:
 
-    # ── Section header ──────────────────────────────────────────────
-    st.markdown(
-        '<div class="section-header">🧬  STRATEGY LAB — DEPOSITORY & SCORED RECOMMENDATIONS</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        f'<div style="font-size:11px;color:#5a7a99;margin-bottom:18px;line-height:1.9;">'
-        f'{len(STRATEGY_DEPOSITORY)} strategies catalogued across directional, neutral, long-vol, short-vol, '
-        f'and structured/OTC categories. Set your view, conviction, and token below — the scoring engine '
-        f'ranks every strategy in real time.</div>',
-        unsafe_allow_html=True
-    )
-
-    # ── CONTROL PANEL ───────────────────────────────────────────────
-    st.markdown('<div class="section-header">YOUR PARAMETERS</div>', unsafe_allow_html=True)
-
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 2, 2, 2])
-
-    with ctrl1:
-        sl_token = st.selectbox(
-            "Token / Asset",
-            ["XDC", "BTC", "ETH", "SOL", "HYPE", "Custom"],
-            key="sl_token_lab"
+    @st.fragment
+    def _strategy_lab_fragment():
+        # ── Section header ──────────────────────────────────────────────
+        st.markdown(
+            '<div class="section-header">🧬  STRATEGY LAB — DEPOSITORY & SCORED RECOMMENDATIONS</div>',
+            unsafe_allow_html=True
         )
-        if sl_token == "Custom":
-            sl_token = st.text_input("Ticker", value="XDC", key="sl_tok_custom").upper()
-
-        sl_view = st.select_slider(
-            "Market View",
-            options=["Strongly Bearish", "Mildly Bearish", "Neutral", "Mildly Bullish", "Strongly Bullish"],
-            value="Mildly Bullish",
-            key="sl_view_lab"
+        st.markdown(
+            f'<div style="font-size:11px;color:#5a7a99;margin-bottom:18px;line-height:1.9;">'
+            f'{len(STRATEGY_DEPOSITORY)} strategies catalogued across directional, neutral, long-vol, short-vol, '
+            f'and structured/OTC categories. Set your view, conviction, and token below — the scoring engine '
+            f'ranks every strategy in real time.</div>',
+            unsafe_allow_html=True
         )
 
-    with ctrl2:
-        sl_conf = st.slider(
-            "Conviction (%)", 10, 100, 65, 5, key="sl_conf_lab",
-            help="How sure are you? Scores high-complexity strategies down when conviction is low."
-        )
-        sl_style = st.radio(
-            "Strategy Style",
-            ["All", "Vanilla Only", "Exotic / OTC Only"],
-            horizontal=True, key="sl_style_lab"
-        )
+        # ── CONTROL PANEL ───────────────────────────────────────────────
+        st.markdown('<div class="section-header">YOUR PARAMETERS</div>', unsafe_allow_html=True)
 
-    with ctrl3:
-        sl_hv_lab  = st.number_input(
-            "Current HV / Implied Vol (%)",
-            value=float(sigma * 100), min_value=1.0, max_value=500.0,
-            key="sl_hv_lab"
-        ) / 100
-        sl_T_lab   = st.slider("Desired Tenor (days)", 7, 365, 30, key="sl_T_lab")
-        sl_notional_lab = st.number_input(
-            "Notional (USD)", value=100_000, step=10_000, key="sl_notional_lab"
-        )
+        ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 2, 2, 2])
 
-    with ctrl4:
-        sl_pcr_lab = st.number_input(
-            "Put/Call Ratio",
-            value=round(float(put_prices[3] / call_prices[3]), 3) if call_prices[3] > 0 else 1.0,
-            format="%.3f", key="sl_pcr_lab",
-            help="ATM P/C ratio. >1.2 = bearish skew, <0.8 = bullish skew"
-        )
-        sl_otc_lab = st.checkbox("Include OTC / Structured Products", value=True, key="sl_otc_lab")
-        sl_topn    = st.slider("Top N to show", 3, len(STRATEGY_DEPOSITORY), 8, key="sl_topn_lab")
-        sl_min_sc  = st.slider("Min score threshold", 0, 80, 0, 5, key="sl_minscore_lab")
-
-    # ── View-to-score-engine mapping ─────────────────────────────────
-    view_engine_map = {
-        "Strongly Bullish": "bullish",
-        "Mildly Bullish":   "bullish",
-        "Neutral":          "neutral",
-        "Mildly Bearish":   "bearish",
-        "Strongly Bearish": "bearish",
-    }
-    # Confidence scalar: Strongly = 1.0, Mildly = 0.75
-    conf_scalar_map = {
-        "Strongly Bullish": 1.0,
-        "Mildly Bullish":   0.75,
-        "Neutral":          0.85,
-        "Mildly Bearish":   0.75,
-        "Strongly Bearish": 1.0,
-    }
-    view_engine  = view_engine_map[sl_view]
-    conf_engine  = (sl_conf / 100) * conf_scalar_map[sl_view]
-
-    # Colour palette for view
-    view_colors = {
-        "Strongly Bullish": "#00e676",
-        "Mildly Bullish":   "#44cc88",
-        "Neutral":          "#f0a500",
-        "Mildly Bearish":   "#ff8a65",
-        "Strongly Bearish": "#ff4b6e",
-    }
-    vc = view_colors[sl_view]
-
-    # ── View summary banner ──────────────────────────────────────────
-    vol_label   = "HIGH" if sl_hv_lab > 0.70 else "LOW" if sl_hv_lab < 0.40 else "MODERATE"
-    vol_color   = "#ff4b6e" if sl_hv_lab > 0.70 else "#00e676" if sl_hv_lab < 0.40 else "#f0a500"
-    pcr_label   = "BEARISH SKEW" if sl_pcr_lab > 1.2 else "BULLISH SKEW" if sl_pcr_lab < 0.8 else "BALANCED"
-    pcr_color   = "#ff4b6e" if sl_pcr_lab > 1.2 else "#00e676" if sl_pcr_lab < 0.8 else "#f0a500"
-
-    st.markdown(f'''
-    <div style="background:linear-gradient(135deg,#0d1a14,#091008);
-                border:1px solid #1e2d40;border-left:5px solid {vc};
-                border-radius:5px;padding:16px 24px;margin:16px 0;
-                display:flex;justify-content:space-between;align-items:center;">
-        <div>
-            <div style="font-size:10px;letter-spacing:3px;color:#3d6080;">CURRENT VIEW</div>
-            <div style="font-family:Space Mono;font-size:26px;color:{vc};margin-top:4px;">{sl_view.upper()}</div>
-            <div style="font-size:11px;color:#5a7a99;margin-top:6px;">
-                Token: <span style="color:#00d4ff;font-weight:bold;">{sl_token}</span>&nbsp;·&nbsp;
-                Conviction: <span style="color:{vc};font-weight:bold;">{sl_conf}%</span>&nbsp;·&nbsp;
-                Vol: <span style="color:{vol_color};font-weight:bold;">{sl_hv_lab:.0%} ({vol_label})</span>&nbsp;·&nbsp;
-                Tenor: <span style="color:#b388ff;font-weight:bold;">{sl_T_lab}d</span>&nbsp;·&nbsp;
-                PCR: <span style="color:{pcr_color};font-weight:bold;">{sl_pcr_lab:.2f} ({pcr_label})</span>
-            </div>
-        </div>
-        <div style="text-align:right;font-size:11px;color:#3d6080;line-height:2.0;">
-            Style: <span style="color:#00d4ff">{sl_style}</span><br>
-            Notional: <span style="color:#5a9abf">${sl_notional_lab:,}</span><br>
-            OTC: <span style="color:{'#00e676' if sl_otc_lab else '#ff4b6e'}">{'Yes' if sl_otc_lab else 'No'}</span>
-        </div>
-    </div>
-    ''', unsafe_allow_html=True)
-
-    # ── RUN SCORING ENGINE ───────────────────────────────────────────
-    raw_results = score_strategies(
-        view_engine, conf_engine, sl_hv_lab, sl_pcr_lab,
-        sl_T_lab, spot, sl_hv_lab, is_otc_ok=sl_otc_lab
-    )
-
-    # Apply style filter
-    def passes_style(name, sdef):
-        is_exotic = "OTC" in sdef.get("tags", []) or \
-                    "structured" in sdef.get("tags", []) or \
-                    "exotic" in sdef.get("tags", []) or \
-                    "barrier" in sdef.get("tags", [])
-        if sl_style == "Vanilla Only" and is_exotic:
-            return False
-        if sl_style == "Exotic / OTC Only" and not is_exotic:
-            return False
-        return True
-
-    filtered = [
-        (name, sc, reasons, sdef)
-        for name, sc, reasons, sdef in raw_results
-        if passes_style(name, sdef) and sc >= sl_min_sc
-    ]
-
-    top_results = filtered[:sl_topn]
-
-    if not top_results:
-        st.warning("No strategies pass the current filters. Try lowering the minimum score or changing the style filter.")
-        st.stop()
-
-    # ── SCORE LEADERBOARD ────────────────────────────────────────────
-    st.markdown('<div class="section-header">SCORE LEADERBOARD</div>', unsafe_allow_html=True)
-
-    bar_names   = [r[0] for r in top_results]
-    bar_scores  = [r[1] for r in top_results]
-    bar_views   = [r[3]["view"] for r in top_results]
-
-    def bar_color(sc):
-        if sc >= 70: return "#00e676"
-        if sc >= 45: return "#f0a500"
-        return "#ff4b6e"
-
-    fig_board = go.Figure(go.Bar(
-        x=bar_scores[::-1],
-        y=bar_names[::-1],
-        orientation="h",
-        marker_color=[bar_color(s) for s in bar_scores[::-1]],
-        marker_line_width=0,
-        text=[f"  {s}  |  {v}" for s, v in zip(bar_scores[::-1], bar_views[::-1])],
-        textposition="outside",
-        textfont=dict(size=10, color="#8fb3d0"),
-    ))
-    fig_board.add_vline(x=70, line_color="#00e676", line_dash="dot",
-                        annotation_text="Strong ≥70", annotation_font_color="#00e676",
-                        annotation_font_size=9)
-    fig_board.add_vline(x=45, line_color="#f0a500", line_dash="dot",
-                        annotation_text="OK ≥45", annotation_font_color="#f0a500",
-                        annotation_font_size=9)
-    fig_board.update_layout(
-        plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-        font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=10),
-        xaxis=dict(gridcolor=_PLT_GRID, range=[0, 120], title="Score / 100"),
-        yaxis=dict(gridcolor=_PLT_GRID),
-        height=max(280, len(top_results) * 40),
-        margin=dict(t=10, b=40, l=10, r=130),
-        showlegend=False
-    )
-    st.plotly_chart(fig_board, use_container_width=True, key=_next_chart_key())
-
-    # ── TOP RECOMMENDATION SPOTLIGHT ────────────────────────────────
-    top_name, top_sc, top_reasons, top_def = top_results[0]
-    top_color = bar_color(top_sc)
-
-    # Compute indicative prices for top strategy
-    T_yrs = sl_T_lab / 365
-    c_atm = black_scholes(spot, spot, T_yrs, r, sl_hv_lab, "call")
-    p_atm = black_scholes(spot, spot, T_yrs, r, sl_hv_lab, "put")
-
-    price_range_top, payoff_top, net_prem_top, legs_top = build_strategy_payoff(
-        top_name, top_def, spot, sl_hv_lab, T_yrs, r
-    )
-
-    rec_cols = st.columns([3, 2])
-    with rec_cols[0]:
-        st.markdown(f'''
-        <div style="background:linear-gradient(135deg,#091408,#060e06);
-                    border:1px solid #1a3020;border-left:5px solid {top_color};
-                    border-radius:6px;padding:20px 26px;">
-            <div style="font-size:10px;letter-spacing:3px;color:#3d6080;margin-bottom:8px;">
-                🏆  TOP RECOMMENDATION FOR {sl_token}
-            </div>
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                <div>
-                    <div style="font-family:Space Mono;font-size:24px;color:{top_color};">{top_name}</div>
-                    <div style="font-size:11px;color:#5a7a99;margin-top:4px;">
-                        View: <span style="color:#f0a500">{top_def["view"]}</span> ·
-                        Vol bias: <span style="color:#b388ff">{top_def["vol_bias"]}</span> ·
-                        Complexity: <span style="color:#00d4ff">{"●" * top_def["complexity"]}{"○" * (5 - top_def["complexity"])}</span>
-                    </div>
-                </div>
-                <div style="font-family:Space Mono;font-size:48px;color:{top_color};line-height:1.0;">
-                    {top_sc}<span style="font-size:16px;color:#3d6080;">/100</span>
-                </div>
-            </div>
-            <div style="font-size:12px;color:#8fb3d0;margin-top:14px;line-height:1.9;">
-                {top_def["description"]}
-            </div>
-            <div style="margin-top:12px;font-size:11px;color:#5a7a99;line-height:2.1;
-                        border-top:1px solid #1a2535;padding-top:10px;">
-                <strong style="color:#3d6080;">Best conditions:</strong> {top_def["best_conditions"]}<br>
-                <strong style="color:#3d6080;">Key risks:</strong> {top_def["risks"]}<br>
-                <strong style="color:#3d6080;">Breakeven:</strong> <span style="color:#f0a500">{top_def["breakeven_note"]}</span><br>
-                <strong style="color:#3d6080;">Max profit:</strong> <span style="color:#00e676">{top_def["max_gain"]}</span> ·
-                <strong style="color:#3d6080;">Max loss:</strong> <span style="color:#ff4b6e">{top_def["max_loss"]}</span>
-            </div>
-            <div style="margin-top:12px;font-size:10px;color:#3d6080;border-top:1px solid #1a2535;padding-top:8px;">
-                WHY NOW: &nbsp;{'&nbsp; · &nbsp;'.join(f'<span style="color:#5a9abf">{rr}</span>' for rr in top_reasons[:4])}
-            </div>
-            <div style="margin-top:10px;font-size:10px;">
-                {''.join(f'<span style="background:#1a2535;color:#5a9abf;padding:2px 8px;margin-right:6px;border-radius:2px;">{t}</span>' for t in top_def.get("tags", []))}
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-    with rec_cols[1]:
-        # Payoff diagram for top recommendation
-        if np.any(payoff_top != 0):
-            fig_top_pay = go.Figure()
-            fig_top_pay.add_trace(go.Scatter(
-                x=price_range_top, y=payoff_top,
-                fill="tozeroy",
-                fillcolor=f"rgba({int(top_color[1:3],16)},{int(top_color[3:5],16)},{int(top_color[5:7],16)},0.07)",
-                line=dict(color=top_color, width=2.5),
-                hovertemplate="Spot: $%{x:.5f}<br>P&L: $%{y:.6f}<extra></extra>"
-            ))
-            fig_top_pay.add_hline(y=0, line_color="#3d6080", line_dash="dot")
-            fig_top_pay.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
-                                  annotation_text="SPOT", annotation_font_color="#ffffff",
-                                  annotation_font_size=9)
-            if net_prem_top != 0:
-                fig_top_pay.add_hline(y=-abs(net_prem_top), line_color="#ff4b6e",
-                                      line_dash="dot", opacity=0.5)
-            fig_top_pay.update_layout(
-                plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-                font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=9),
-                xaxis=dict(gridcolor=_PLT_GRID, title="Spot at Expiry ($)", tickformat=".5f"),
-                yaxis=dict(gridcolor=_PLT_GRID, title="P&L per unit ($)"),
-                height=320, showlegend=False,
-                margin=dict(t=20, b=50, l=10, r=10)
+        with ctrl1:
+            sl_token = st.selectbox(
+                "Token / Asset",
+                ["XDC", "BTC", "ETH", "SOL", "HYPE", "Custom"],
+                key="sl_token_lab"
             )
-            st.plotly_chart(fig_top_pay, use_container_width=True, key=_next_chart_key())
+            if sl_token == "Custom":
+                sl_token = st.text_input("Ticker", value="XDC", key="sl_tok_custom").upper()
 
-            # Net premium card
-            if legs_top:
-                st.markdown(f'''
-                <div style="background:#0a0c10;border:1px solid #1a2535;border-radius:3px;padding:12px 16px;font-size:11px;">
-                    <div style="color:#3d6080;letter-spacing:2px;font-size:10px;margin-bottom:8px;">INDICATIVE COST</div>
-                    {''.join(
-                        f'<div style="color:#5a7a99;">'
-                        f'{lg["direction"].upper()} {lg["qty"]}× {lg["type"].upper()} @ {lg["strike_label"]} '
-                        f'= <span style="color:{("#ff4b6e" if lg["direction"]=="buy" else "#00e676")}">'
-                        f'{"−" if lg["direction"]=="buy" else "+"}'
-                        f'${lg["premium"]:.6f}</span></div>'
-                        for lg in legs_top
-                    )}
-                    <div style="border-top:1px solid #1a2535;margin-top:8px;padding-top:8px;">
-                        Net: <span style="color:{("#ff4b6e" if net_prem_top < 0 else "#00e676")};font-size:13px;">
-                        {"−" if net_prem_top < 0 else "+"}'${abs(net_prem_top):.6f}</span>
-                        <span style="color:#3d6080;"> per unit</span><br>
-                        USD impact on ${sl_notional_lab:,}:
-                        <span style="color:{("#ff4b6e" if net_prem_top < 0 else "#00e676")};">
-                        {"−" if net_prem_top < 0 else "+"}${abs(net_prem_top) * sl_notional_lab / spot:,.0f}
-                        </span>
-                    </div>
-                </div>
-                ''', unsafe_allow_html=True)
+            sl_view = st.select_slider(
+                "Market View",
+                options=["Strongly Bearish", "Mildly Bearish", "Neutral", "Mildly Bullish", "Strongly Bullish"],
+                value="Mildly Bullish",
+                key="sl_view_lab"
+            )
 
-    # ── TOP N STRATEGY CARDS ─────────────────────────────────────────
-    st.markdown('<div class="section-header">ALL RANKED STRATEGIES — DETAILED BREAKDOWN</div>',
-                unsafe_allow_html=True)
+        with ctrl2:
+            sl_conf = st.slider(
+                "Conviction (%)", 10, 100, 65, 5, key="sl_conf_lab",
+                help="How sure are you? Scores high-complexity strategies down when conviction is low."
+            )
+            sl_style = st.radio(
+                "Strategy Style",
+                ["All", "Vanilla Only", "Exotic / OTC Only"],
+                horizontal=True, key="sl_style_lab"
+            )
 
-    medals = ["🥇", "🥈", "🥉"] + [f"#{i+1}" for i in range(3, 20)]
+        with ctrl3:
+            sl_hv_lab  = st.number_input(
+                "Current HV / Implied Vol (%)",
+                value=float(sigma * 100), min_value=1.0, max_value=500.0,
+                key="sl_hv_lab"
+            ) / 100
+            sl_T_lab   = st.slider("Desired Tenor (days)", 7, 365, 30, key="sl_T_lab")
+            sl_notional_lab = st.number_input(
+                "Notional (USD)", value=100_000, step=10_000, key="sl_notional_lab"
+            )
 
-    for idx, (name, sc, reasons, sdef) in enumerate(top_results):
-        sc_c = bar_color(sc)
-        is_exotic_tag = any(t in sdef.get("tags", [])
-                            for t in ["OTC", "structured", "exotic", "barrier"])
-        cat_badge = (
-            f'<span style="background:#1e1230;color:#e040fb;padding:1px 7px;'
-            f'border-radius:2px;font-size:9px;">EXOTIC/OTC</span>'
-            if is_exotic_tag else
-            f'<span style="background:#0d1a28;color:#00d4ff;padding:1px 7px;'
-            f'border-radius:2px;font-size:9px;">VANILLA</span>'
-        )
+        with ctrl4:
+            sl_pcr_lab = st.number_input(
+                "Put/Call Ratio",
+                value=round(float(put_prices[3] / call_prices[3]), 3) if call_prices[3] > 0 else 1.0,
+                format="%.3f", key="sl_pcr_lab",
+                help="ATM P/C ratio. >1.2 = bearish skew, <0.8 = bullish skew"
+            )
+            sl_otc_lab = st.checkbox("Include OTC / Structured Products", value=True, key="sl_otc_lab")
+            sl_topn    = st.slider("Top N to show", 3, len(STRATEGY_DEPOSITORY), 8, key="sl_topn_lab")
+            sl_min_sc  = st.slider("Min score threshold", 0, 80, 0, 5, key="sl_minscore_lab")
 
-        with st.expander(
-            f"{medals[idx]}  {name}   —   {sc}/100   [{sdef['view']}]",
-            expanded=(idx < 2)
-        ):
-            card_c1, card_c2, card_c3 = st.columns([3, 2, 2])
+        # ── View-to-score-engine mapping ─────────────────────────────────
+        view_engine_map = {
+            "Strongly Bullish": "bullish",
+            "Mildly Bullish":   "bullish",
+            "Neutral":          "neutral",
+            "Mildly Bearish":   "bearish",
+            "Strongly Bearish": "bearish",
+        }
+        # Confidence scalar: Strongly = 1.0, Mildly = 0.75
+        conf_scalar_map = {
+            "Strongly Bullish": 1.0,
+            "Mildly Bullish":   0.75,
+            "Neutral":          0.85,
+            "Mildly Bearish":   0.75,
+            "Strongly Bearish": 1.0,
+        }
+        view_engine  = view_engine_map[sl_view]
+        conf_engine  = (sl_conf / 100) * conf_scalar_map[sl_view]
 
-            with card_c1:
-                # Reason bullets
-                reason_html = "".join(
-                    f'<div style="margin:2px 0;">'
-                    f'<span style="color:{"#ff4b6e" if "⚠" in rr else "#00e676"}">{"⚠" if "⚠" in rr else "✓"}</span> '
-                    f'<span style="color:#8fb3d0">{rr.replace("⚠️ ", "").replace("✅ ", "")}</span></div>'
-                    for rr in reasons[:6]
-                )
-                st.markdown(f'''
-                <div style="font-size:11px;line-height:1.9;">
-                    {cat_badge}
-                    <div style="font-size:12px;color:#8fb3d0;margin-top:10px;">{sdef["description"]}</div>
-                    <div style="margin-top:10px;border-top:1px solid #1a2535;padding-top:8px;">
-                        <div style="color:#3d6080;font-size:10px;letter-spacing:2px;margin-bottom:4px;">SCORING REASONS</div>
-                        {reason_html}
-                    </div>
-                    <div style="margin-top:10px;font-size:10px;color:#5a7a99;line-height:2.0;">
-                        <strong style="color:#3d6080;">Best when:</strong> {sdef["best_conditions"]}<br>
-                        <strong style="color:#3d6080;">Risks:</strong> {sdef["risks"]}
-                    </div>
-                </div>
-                ''', unsafe_allow_html=True)
+        # Colour palette for view
+        view_colors = {
+            "Strongly Bullish": "#00e676",
+            "Mildly Bullish":   "#44cc88",
+            "Neutral":          "#f0a500",
+            "Mildly Bearish":   "#ff8a65",
+            "Strongly Bearish": "#ff4b6e",
+        }
+        vc = view_colors[sl_view]
 
-            with card_c2:
-                st.markdown(f'''
-                <div style="font-size:11px;color:#5a7a99;line-height:2.1;">
-                    <div style="color:#3d6080;font-size:10px;letter-spacing:2px;margin-bottom:6px;">PROFILE</div>
-                    Max gain: <span style="color:#00e676">{sdef["max_gain"]}</span><br>
-                    Max loss: <span style="color:#ff4b6e">{sdef["max_loss"]}</span><br>
-                    Breakeven: <span style="color:#f0a500">{sdef["breakeven_note"]}</span><br>
-                    Complexity: <span style="color:#00d4ff">{"●" * sdef["complexity"]}{"○" * (5-sdef["complexity"])}</span><br>
-                    Vol bias: <span style="color:#b388ff">{sdef["vol_bias"]}</span><br>
-                </div>
-                ''', unsafe_allow_html=True)
+        # ── View summary banner ──────────────────────────────────────────
+        vol_label   = "HIGH" if sl_hv_lab > 0.70 else "LOW" if sl_hv_lab < 0.40 else "MODERATE"
+        vol_color   = "#ff4b6e" if sl_hv_lab > 0.70 else "#00e676" if sl_hv_lab < 0.40 else "#f0a500"
+        pcr_label   = "BEARISH SKEW" if sl_pcr_lab > 1.2 else "BULLISH SKEW" if sl_pcr_lab < 0.8 else "BALANCED"
+        pcr_color   = "#ff4b6e" if sl_pcr_lab > 1.2 else "#00e676" if sl_pcr_lab < 0.8 else "#f0a500"
 
-                # Legs table
-                non_custom_legs = [lg for lg in sdef["legs"] if lg[0] != "custom"]
-                if non_custom_legs:
-                    T_yrs_c = sl_T_lab / 365
-                    leg_rows = []
-                    for leg in non_custom_legs:
-                        opt_t, direction, strike_lbl, qty = leg
-                        strike_map_c = {
-                            "ATM": spot, "+10%": spot*1.10, "+20%": spot*1.20,
-                            "+30%": spot*1.30, "+40%": spot*1.40, "+50%": spot*1.50,
-                            "-10%": spot*0.90, "-20%": spot*0.80, "-30%": spot*0.70,
-                            "-40%": spot*0.60, "-50%": spot*0.50,
-                            "ATM farther expiry": spot
-                        }
-                        K_leg  = strike_map_c.get(strike_lbl, spot)
-                        prem_c = black_scholes(spot, K_leg, T_yrs_c, r, sl_hv_lab, opt_t)
-                        sign   = "+" if direction == "buy" else "−"
-                        leg_rows.append({
-                            "Leg":     f"{direction.upper()} {qty}× {opt_t.upper()}",
-                            "Strike":  strike_lbl,
-                            "K ($)":   f"${K_leg:.5f}",
-                            "Premium": f"{sign}${prem_c:.6f}",
-                        })
-                    st.dataframe(pd.DataFrame(leg_rows), hide_index=True,
-                                 use_container_width=True)
-
-            with card_c3:
-                # Payoff chart
-                pr, pay, np_leg, _ = build_strategy_payoff(
-                    name, sdef, spot, sl_hv_lab, sl_T_lab / 365, r
-                )
-                if np.any(pay != 0):
-                    fig_card = go.Figure()
-                    fig_card.add_trace(go.Scatter(
-                        x=pr, y=pay, fill="tozeroy",
-                        fillcolor=f"rgba({int(sc_c[1:3],16)},{int(sc_c[3:5],16)},{int(sc_c[5:7],16)},0.06)",
-                        line=dict(color=sc_c, width=2),
-                        hovertemplate="Spot: $%{x:.5f}<br>P&L: $%{y:.6f}<extra></extra>"
-                    ))
-                    fig_card.add_hline(y=0, line_color="#3d6080", line_dash="dot")
-                    fig_card.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
-                                       annotation_text="S", annotation_font_size=9,
-                                       annotation_font_color="#ffffff")
-                    fig_card.update_layout(
-                        plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-                        font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=9),
-                        xaxis=dict(gridcolor=_PLT_GRID, tickformat=".5f"),
-                        yaxis=dict(gridcolor=_PLT_GRID),
-                        height=200, showlegend=False,
-                        margin=dict(t=10, b=40, l=0, r=0)
-                    )
-                    st.plotly_chart(fig_card, use_container_width=True, key=_next_chart_key())
-                else:
-                    st.caption("Schematic payoff — exotic structure")
-
-                # USD notional impact
-                if np_leg != 0:
-                    usd_cost = abs(np_leg) * sl_notional_lab / spot
-                    st.markdown(
-                        f'<div style="font-size:10px;color:#3d6080;text-align:center;">'
-                        f'Net: <span style="color:{("#ff4b6e" if np_leg < 0 else "#00e676")};">'
-                        f'{"−" if np_leg < 0 else "+"}${abs(np_leg):.6f}/unit · '
-                        f'${usd_cost:,.0f} on ${sl_notional_lab:,}</span></div>',
-                        unsafe_allow_html=True
-                    )
-
-    # ── OVERLAY: TOP 3 PAYOFFS COMPARED ─────────────────────────────
-    st.markdown('<div class="section-header">TOP 3 STRATEGIES — PAYOFF OVERLAY</div>',
-                unsafe_allow_html=True)
-
-    overlay_palette = ["#00d4ff", "#00e676", "#f0a500", "#b388ff", "#ff8a65"]
-    S_rng_ov = np.linspace(spot * 0.35, spot * 2.60, 400)
-
-    fig_ov = go.Figure()
-    for oi, (oname, osc, _, odef) in enumerate(top_results[:3]):
-        pr_ov, pay_ov, _, _ = build_strategy_payoff(
-            oname, odef, spot, sl_hv_lab, sl_T_lab / 365, r
-        )
-        if np.any(pay_ov != 0):
-            # Interpolate to common range
-            pay_ov_interp = np.interp(S_rng_ov, pr_ov, pay_ov)
-            fig_ov.add_trace(go.Scatter(
-                x=S_rng_ov, y=pay_ov_interp,
-                name=f"#{oi+1} {oname} ({osc})",
-                line=dict(color=overlay_palette[oi], width=2.5),
-                hovertemplate=f"<b>{oname}</b><br>Spot: $%{{x:.5f}}<br>P&L: $%{{y:.6f}}<extra></extra>"
-            ))
-
-    fig_ov.add_hline(y=0, line_color="#3d6080", line_dash="dot")
-    fig_ov.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
-                     annotation_text="CURRENT SPOT", annotation_font_color="#ffffff")
-    fig_ov.update_layout(
-        plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-        font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=10),
-        xaxis=dict(gridcolor=_PLT_GRID, title="Spot at Expiry ($)", tickformat=".5f"),
-        yaxis=dict(gridcolor=_PLT_GRID, title="P&L per unit ($)"),
-        legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR, font=dict(size=10)),
-        height=380, margin=dict(t=10, b=50),
-        hovermode="x unified"
-    )
-    st.plotly_chart(fig_ov, use_container_width=True, key=_next_chart_key())
-
-    # ── MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES ────────────────
-    st.markdown('<div class="section-header">MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES (10,000 PATHS)</div>',
-                unsafe_allow_html=True)
-    st.markdown(
-        '<div style="font-size:11px;color:#5a7a99;margin-bottom:12px;line-height:1.8;">'
-        'Simulates 10,000 GBM paths to compute expected P&L distributions for the top 3 strategies. '
-        'Uses the current vol and drift assumptions.</div>',
-        unsafe_allow_html=True
-    )
-
-    np.random.seed(2024)
-    n_mc_strat = 10_000
-    T_mc_strat = sl_T_lab / 365
-    Z_mc_strat = np.random.standard_normal(n_mc_strat)
-    S_mc_terminal = spot * np.exp((r - 0.5 * sl_hv_lab**2) * T_mc_strat + sl_hv_lab * np.sqrt(T_mc_strat) * Z_mc_strat)
-
-    mc_strat_cols = st.columns(min(3, len(top_results)))
-    for si, (sname, ssc, _, sdef) in enumerate(top_results[:3]):
-        pr_mc, pay_mc, nprem_mc, legs_mc = build_strategy_payoff(
-            sname, sdef, spot, sl_hv_lab, T_mc_strat, r
-        )
-        if np.any(pay_mc != 0) and len(pr_mc) > 0:
-            # Interpolate payoff at simulated terminal prices
-            pnl_sims = np.interp(S_mc_terminal, pr_mc, pay_mc)
-            mean_pnl = np.mean(pnl_sims)
-            p_profit = np.mean(pnl_sims > 0) * 100
-            var_95 = np.percentile(pnl_sims, 5)
-            best_95 = np.percentile(pnl_sims, 95)
-
-            with mc_strat_cols[si]:
-                pnl_color = '#00e676' if mean_pnl > 0 else '#ff4b6e'
-                st.markdown(f'''
-                <div class="metric-card" style="border-left-color:{pnl_color}">
-                    <div class="metric-label">#{si+1} {sname}</div>
-                    <div class="metric-value" style="font-size:16px;color:{pnl_color};">E[P&L]: ${mean_pnl:.6f}</div>
-                    <div class="metric-sub">
-                        P(profit): {p_profit:.0f}% · VaR(5%): ${var_95:.6f} · Best(95%): ${best_95:.6f}
-                    </div>
-                </div>
-                ''', unsafe_allow_html=True)
-
-                # Mini histogram
-                fig_mc_mini = go.Figure(go.Histogram(
-                    x=pnl_sims, nbinsx=40,
-                    marker_color=pnl_color, marker_line_width=0, opacity=0.7
-                ))
-                fig_mc_mini.add_vline(x=0, line_color='#ffffff', line_dash='dot')
-                fig_mc_mini.add_vline(x=mean_pnl, line_color='#f0a500', line_dash='dash')
-                fig_mc_mini.update_layout(
-                    plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
-                    font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=9),
-                    xaxis=dict(gridcolor=_PLT_GRID, title='P&L ($)'),
-                    yaxis=dict(gridcolor=_PLT_GRID), showlegend=False,
-                    height=180, margin=dict(t=5, b=30, l=10, r=10)
-                )
-                st.plotly_chart(fig_mc_mini, use_container_width=True, key=_next_chart_key())
-
-    # ── FULL DEPOSITORY BROWSER ──────────────────────────────────────
-    st.markdown(
-        f'<div class="section-header">FULL STRATEGY DEPOSITORY — ALL {len(STRATEGY_DEPOSITORY)} STRATEGIES</div>',
-        unsafe_allow_html=True
-    )
-
-    dep_filter_col1, dep_filter_col2 = st.columns(2)
-    with dep_filter_col1:
-        dep_view_filter = st.multiselect(
-            "Filter by view",
-            ["bullish", "mildly bullish", "neutral", "bearish",
-             "high vol", "structured", "all"],
-            default=["bullish", "mildly bullish", "neutral", "bearish",
-                     "high vol", "structured", "all"],
-            key="dep_view_filter"
-        )
-    with dep_filter_col2:
-        dep_tag_filter = st.multiselect(
-            "Filter by tag",
-            sorted(set(t for s in STRATEGY_DEPOSITORY.values() for t in s.get("tags", []))),
-            default=[],
-            key="dep_tag_filter"
-        )
-
-    # Build depository table
-    score_lookup = {name: sc for name, sc, _, _ in raw_results}
-    dep_rows = []
-    for strat_name, sdef in STRATEGY_DEPOSITORY.items():
-        view_match = any(vf in sdef["view"].lower() for vf in dep_view_filter) or not dep_view_filter
-        tag_match  = (not dep_tag_filter) or any(t in sdef.get("tags", []) for t in dep_tag_filter)
-        if not view_match or not tag_match:
-            continue
-
-        sc_val = score_lookup.get(strat_name, 0)
-        dep_rows.append({
-            "Strategy":    strat_name,
-            "View":        sdef["view"],
-            "Vol Bias":    sdef["vol_bias"],
-            "Max Gain":    sdef["max_gain"],
-            "Max Loss":    sdef["max_loss"],
-            "Complexity":  "●" * sdef["complexity"] + "○" * (5 - sdef["complexity"]),
-            "Tags":        ", ".join(sdef.get("tags", [])),
-            "Your Score":  sc_val,
-        })
-
-    dep_df = pd.DataFrame(dep_rows).sort_values("Your Score", ascending=False)
-    st.dataframe(dep_df, use_container_width=True, hide_index=True, height=460)
-
-    # Download button
-    csv_data = dep_df.to_csv(index=False).encode()
-    st.download_button(
-        "⬇️  Download full depository as CSV",
-        data=csv_data,
-        file_name=f"strategy_depository_{sl_token}_{sl_view.replace(' ','_')}.csv",
-        mime="text/csv",
-        key="dep_download"
-    )
-
-    # ── SCORING METHODOLOGY ──────────────────────────────────────────
-    with st.expander("ℹ️  How the scoring engine works"):
         st.markdown(f'''
-        <div style="font-size:11px;color:#5a7a99;line-height:2.1;">
-            <strong style="color:#00d4ff;">View Alignment (0–35 pts × conviction scalar)</strong><br>
-            Perfect match = 35 × confidence. Neutral strategy in directional view = 15 pts.
-            Opposite view = −30 pts (hard penalty).<br><br>
-            <strong style="color:#00d4ff;">Vol Regime (0–25 pts)</strong><br>
-            Current HV = <strong style="color:{vol_color}">{sl_hv_lab:.0%} ({vol_label})</strong>.
-            Short-vol strategies score 25pts in high-IV, −15 in low-IV.
-            Long-vol strategies score 25pts in low-IV, −15 in high-IV.<br><br>
-            <strong style="color:#00d4ff;">Put/Call Ratio / Skew (0–15 pts)</strong><br>
-            PCR = <strong style="color:{pcr_color}">{sl_pcr_lab:.2f} ({pcr_label})</strong>.
-            High put skew boosts risk reversals and cash-secured puts.
-            Low PCR boosts debit call strategies.<br><br>
-            <strong style="color:#00d4ff;">Tenor Fit (0–10 pts)</strong><br>
-            Short tenor ({sl_T_lab}d) → income/theta strategies boosted.
-            Long tenor → long-vol and LEAP structures boosted.<br><br>
-            <strong style="color:#00d4ff;">Complexity Penalty (−8 pts)</strong><br>
-            Applied when conviction &lt; 50% and strategy complexity ≥ 4.
-            Don't run complex structures on weak conviction.<br><br>
-            <strong style="color:#00d4ff;">OTC Gate</strong><br>
-            Structured/OTC strategies score −20 if OTC toggle is off.
+        <div style="background:linear-gradient(135deg,#0d1a14,#091008);
+                    border:1px solid #1e2d40;border-left:5px solid {vc};
+                    border-radius:5px;padding:16px 24px;margin:16px 0;
+                    display:flex;justify-content:space-between;align-items:center;">
+            <div>
+                <div style="font-size:10px;letter-spacing:3px;color:#3d6080;">CURRENT VIEW</div>
+                <div style="font-family:Space Mono;font-size:26px;color:{vc};margin-top:4px;">{sl_view.upper()}</div>
+                <div style="font-size:11px;color:#5a7a99;margin-top:6px;">
+                    Token: <span style="color:#00d4ff;font-weight:bold;">{sl_token}</span>&nbsp;·&nbsp;
+                    Conviction: <span style="color:{vc};font-weight:bold;">{sl_conf}%</span>&nbsp;·&nbsp;
+                    Vol: <span style="color:{vol_color};font-weight:bold;">{sl_hv_lab:.0%} ({vol_label})</span>&nbsp;·&nbsp;
+                    Tenor: <span style="color:#b388ff;font-weight:bold;">{sl_T_lab}d</span>&nbsp;·&nbsp;
+                    PCR: <span style="color:{pcr_color};font-weight:bold;">{sl_pcr_lab:.2f} ({pcr_label})</span>
+                </div>
+            </div>
+            <div style="text-align:right;font-size:11px;color:#3d6080;line-height:2.0;">
+                Style: <span style="color:#00d4ff">{sl_style}</span><br>
+                Notional: <span style="color:#5a9abf">${sl_notional_lab:,}</span><br>
+                OTC: <span style="color:{'#00e676' if sl_otc_lab else '#ff4b6e'}">{'Yes' if sl_otc_lab else 'No'}</span>
+            </div>
         </div>
         ''', unsafe_allow_html=True)
+
+        # ── RUN SCORING ENGINE ───────────────────────────────────────────
+        raw_results = score_strategies(
+            view_engine, conf_engine, sl_hv_lab, sl_pcr_lab,
+            sl_T_lab, spot, sl_hv_lab, is_otc_ok=sl_otc_lab
+        )
+
+        # Apply style filter
+        def passes_style(name, sdef):
+            is_exotic = "OTC" in sdef.get("tags", []) or \
+                        "structured" in sdef.get("tags", []) or \
+                        "exotic" in sdef.get("tags", []) or \
+                        "barrier" in sdef.get("tags", [])
+            if sl_style == "Vanilla Only" and is_exotic:
+                return False
+            if sl_style == "Exotic / OTC Only" and not is_exotic:
+                return False
+            return True
+
+        filtered = [
+            (name, sc, reasons, sdef)
+            for name, sc, reasons, sdef in raw_results
+            if passes_style(name, sdef) and sc >= sl_min_sc
+        ]
+
+        top_results = filtered[:sl_topn]
+
+        if not top_results:
+            st.warning("No strategies pass the current filters. Try lowering the minimum score or changing the style filter.")
+            st.stop()
+
+        # ── SCORE LEADERBOARD ────────────────────────────────────────────
+        st.markdown('<div class="section-header">SCORE LEADERBOARD</div>', unsafe_allow_html=True)
+
+        bar_names   = [r[0] for r in top_results]
+        bar_scores  = [r[1] for r in top_results]
+        bar_views   = [r[3]["view"] for r in top_results]
+
+        def bar_color(sc):
+            if sc >= 70: return "#00e676"
+            if sc >= 45: return "#f0a500"
+            return "#ff4b6e"
+
+        fig_board = go.Figure(go.Bar(
+            x=bar_scores[::-1],
+            y=bar_names[::-1],
+            orientation="h",
+            marker_color=[bar_color(s) for s in bar_scores[::-1]],
+            marker_line_width=0,
+            text=[f"  {s}  |  {v}" for s, v in zip(bar_scores[::-1], bar_views[::-1])],
+            textposition="outside",
+            textfont=dict(size=10, color="#8fb3d0"),
+        ))
+        fig_board.add_vline(x=70, line_color="#00e676", line_dash="dot",
+                            annotation_text="Strong ≥70", annotation_font_color="#00e676",
+                            annotation_font_size=9)
+        fig_board.add_vline(x=45, line_color="#f0a500", line_dash="dot",
+                            annotation_text="OK ≥45", annotation_font_color="#f0a500",
+                            annotation_font_size=9)
+        fig_board.update_layout(
+            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+            font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=10),
+            xaxis=dict(gridcolor=_PLT_GRID, range=[0, 120], title="Score / 100"),
+            yaxis=dict(gridcolor=_PLT_GRID),
+            height=max(280, len(top_results) * 40),
+            margin=dict(t=10, b=40, l=10, r=130),
+            showlegend=False
+        )
+        st.plotly_chart(fig_board, use_container_width=True, key=_next_chart_key())
+
+        # ── TOP RECOMMENDATION SPOTLIGHT ────────────────────────────────
+        top_name, top_sc, top_reasons, top_def = top_results[0]
+        top_color = bar_color(top_sc)
+
+        # Compute indicative prices for top strategy
+        T_yrs = sl_T_lab / 365
+        c_atm = black_scholes(spot, spot, T_yrs, r, sl_hv_lab, "call")
+        p_atm = black_scholes(spot, spot, T_yrs, r, sl_hv_lab, "put")
+
+        price_range_top, payoff_top, net_prem_top, legs_top = build_strategy_payoff(
+            top_name, top_def, spot, sl_hv_lab, T_yrs, r
+        )
+
+        rec_cols = st.columns([3, 2])
+        with rec_cols[0]:
+            st.markdown(f'''
+            <div style="background:linear-gradient(135deg,#091408,#060e06);
+                        border:1px solid #1a3020;border-left:5px solid {top_color};
+                        border-radius:6px;padding:20px 26px;">
+                <div style="font-size:10px;letter-spacing:3px;color:#3d6080;margin-bottom:8px;">
+                    🏆  TOP RECOMMENDATION FOR {sl_token}
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div>
+                        <div style="font-family:Space Mono;font-size:24px;color:{top_color};">{top_name}</div>
+                        <div style="font-size:11px;color:#5a7a99;margin-top:4px;">
+                            View: <span style="color:#f0a500">{top_def["view"]}</span> ·
+                            Vol bias: <span style="color:#b388ff">{top_def["vol_bias"]}</span> ·
+                            Complexity: <span style="color:#00d4ff">{"●" * top_def["complexity"]}{"○" * (5 - top_def["complexity"])}</span>
+                        </div>
+                    </div>
+                    <div style="font-family:Space Mono;font-size:48px;color:{top_color};line-height:1.0;">
+                        {top_sc}<span style="font-size:16px;color:#3d6080;">/100</span>
+                    </div>
+                </div>
+                <div style="font-size:12px;color:#8fb3d0;margin-top:14px;line-height:1.9;">
+                    {top_def["description"]}
+                </div>
+                <div style="margin-top:12px;font-size:11px;color:#5a7a99;line-height:2.1;
+                            border-top:1px solid #1a2535;padding-top:10px;">
+                    <strong style="color:#3d6080;">Best conditions:</strong> {top_def["best_conditions"]}<br>
+                    <strong style="color:#3d6080;">Key risks:</strong> {top_def["risks"]}<br>
+                    <strong style="color:#3d6080;">Breakeven:</strong> <span style="color:#f0a500">{top_def["breakeven_note"]}</span><br>
+                    <strong style="color:#3d6080;">Max profit:</strong> <span style="color:#00e676">{top_def["max_gain"]}</span> ·
+                    <strong style="color:#3d6080;">Max loss:</strong> <span style="color:#ff4b6e">{top_def["max_loss"]}</span>
+                </div>
+                <div style="margin-top:12px;font-size:10px;color:#3d6080;border-top:1px solid #1a2535;padding-top:8px;">
+                    WHY NOW: &nbsp;{'&nbsp; · &nbsp;'.join(f'<span style="color:#5a9abf">{rr}</span>' for rr in top_reasons[:4])}
+                </div>
+                <div style="margin-top:10px;font-size:10px;">
+                    {''.join(f'<span style="background:#1a2535;color:#5a9abf;padding:2px 8px;margin-right:6px;border-radius:2px;">{t}</span>' for t in top_def.get("tags", []))}
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
+        with rec_cols[1]:
+            # Payoff diagram for top recommendation
+            if np.any(payoff_top != 0):
+                fig_top_pay = go.Figure()
+                fig_top_pay.add_trace(go.Scatter(
+                    x=price_range_top, y=payoff_top,
+                    fill="tozeroy",
+                    fillcolor=f"rgba({int(top_color[1:3],16)},{int(top_color[3:5],16)},{int(top_color[5:7],16)},0.07)",
+                    line=dict(color=top_color, width=2.5),
+                    hovertemplate="Spot: $%{x:.5f}<br>P&L: $%{y:.6f}<extra></extra>"
+                ))
+                fig_top_pay.add_hline(y=0, line_color="#3d6080", line_dash="dot")
+                fig_top_pay.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
+                                      annotation_text="SPOT", annotation_font_color="#ffffff",
+                                      annotation_font_size=9)
+                if net_prem_top != 0:
+                    fig_top_pay.add_hline(y=-abs(net_prem_top), line_color="#ff4b6e",
+                                          line_dash="dot", opacity=0.5)
+                fig_top_pay.update_layout(
+                    plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+                    font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=9),
+                    xaxis=dict(gridcolor=_PLT_GRID, title="Spot at Expiry ($)", tickformat=".5f"),
+                    yaxis=dict(gridcolor=_PLT_GRID, title="P&L per unit ($)"),
+                    height=320, showlegend=False,
+                    margin=dict(t=20, b=50, l=10, r=10)
+                )
+                st.plotly_chart(fig_top_pay, use_container_width=True, key=_next_chart_key())
+
+                # Net premium card
+                if legs_top:
+                    st.markdown(f'''
+                    <div style="background:#0a0c10;border:1px solid #1a2535;border-radius:3px;padding:12px 16px;font-size:11px;">
+                        <div style="color:#3d6080;letter-spacing:2px;font-size:10px;margin-bottom:8px;">INDICATIVE COST</div>
+                        {''.join(
+                            f'<div style="color:#5a7a99;">'
+                            f'{lg["direction"].upper()} {lg["qty"]}× {lg["type"].upper()} @ {lg["strike_label"]} '
+                            f'= <span style="color:{("#ff4b6e" if lg["direction"]=="buy" else "#00e676")}">'
+                            f'{"−" if lg["direction"]=="buy" else "+"}'
+                            f'${lg["premium"]:.6f}</span></div>'
+                            for lg in legs_top
+                        )}
+                        <div style="border-top:1px solid #1a2535;margin-top:8px;padding-top:8px;">
+                            Net: <span style="color:{("#ff4b6e" if net_prem_top < 0 else "#00e676")};font-size:13px;">
+                            {"−" if net_prem_top < 0 else "+"}'${abs(net_prem_top):.6f}</span>
+                            <span style="color:#3d6080;"> per unit</span><br>
+                            USD impact on ${sl_notional_lab:,}:
+                            <span style="color:{("#ff4b6e" if net_prem_top < 0 else "#00e676")};">
+                            {"−" if net_prem_top < 0 else "+"}${abs(net_prem_top) * sl_notional_lab / spot:,.0f}
+                            </span>
+                        </div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
+        # ── TOP N STRATEGY CARDS ─────────────────────────────────────────
+        st.markdown('<div class="section-header">ALL RANKED STRATEGIES — DETAILED BREAKDOWN</div>',
+                    unsafe_allow_html=True)
+
+        medals = ["🥇", "🥈", "🥉"] + [f"#{i+1}" for i in range(3, 20)]
+
+        for idx, (name, sc, reasons, sdef) in enumerate(top_results):
+            sc_c = bar_color(sc)
+            is_exotic_tag = any(t in sdef.get("tags", [])
+                                for t in ["OTC", "structured", "exotic", "barrier"])
+            cat_badge = (
+                f'<span style="background:#1e1230;color:#e040fb;padding:1px 7px;'
+                f'border-radius:2px;font-size:9px;">EXOTIC/OTC</span>'
+                if is_exotic_tag else
+                f'<span style="background:#0d1a28;color:#00d4ff;padding:1px 7px;'
+                f'border-radius:2px;font-size:9px;">VANILLA</span>'
+            )
+
+            with st.expander(
+                f"{medals[idx]}  {name}   —   {sc}/100   [{sdef['view']}]",
+                expanded=(idx < 2)
+            ):
+                card_c1, card_c2, card_c3 = st.columns([3, 2, 2])
+
+                with card_c1:
+                    # Reason bullets
+                    reason_html = "".join(
+                        f'<div style="margin:2px 0;">'
+                        f'<span style="color:{"#ff4b6e" if "⚠" in rr else "#00e676"}">{"⚠" if "⚠" in rr else "✓"}</span> '
+                        f'<span style="color:#8fb3d0">{rr.replace("⚠️ ", "").replace("✅ ", "")}</span></div>'
+                        for rr in reasons[:6]
+                    )
+                    st.markdown(f'''
+                    <div style="font-size:11px;line-height:1.9;">
+                        {cat_badge}
+                        <div style="font-size:12px;color:#8fb3d0;margin-top:10px;">{sdef["description"]}</div>
+                        <div style="margin-top:10px;border-top:1px solid #1a2535;padding-top:8px;">
+                            <div style="color:#3d6080;font-size:10px;letter-spacing:2px;margin-bottom:4px;">SCORING REASONS</div>
+                            {reason_html}
+                        </div>
+                        <div style="margin-top:10px;font-size:10px;color:#5a7a99;line-height:2.0;">
+                            <strong style="color:#3d6080;">Best when:</strong> {sdef["best_conditions"]}<br>
+                            <strong style="color:#3d6080;">Risks:</strong> {sdef["risks"]}
+                        </div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
+                with card_c2:
+                    st.markdown(f'''
+                    <div style="font-size:11px;color:#5a7a99;line-height:2.1;">
+                        <div style="color:#3d6080;font-size:10px;letter-spacing:2px;margin-bottom:6px;">PROFILE</div>
+                        Max gain: <span style="color:#00e676">{sdef["max_gain"]}</span><br>
+                        Max loss: <span style="color:#ff4b6e">{sdef["max_loss"]}</span><br>
+                        Breakeven: <span style="color:#f0a500">{sdef["breakeven_note"]}</span><br>
+                        Complexity: <span style="color:#00d4ff">{"●" * sdef["complexity"]}{"○" * (5-sdef["complexity"])}</span><br>
+                        Vol bias: <span style="color:#b388ff">{sdef["vol_bias"]}</span><br>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
+                    # Legs table
+                    non_custom_legs = [lg for lg in sdef["legs"] if lg[0] != "custom"]
+                    if non_custom_legs:
+                        T_yrs_c = sl_T_lab / 365
+                        leg_rows = []
+                        for leg in non_custom_legs:
+                            opt_t, direction, strike_lbl, qty = leg
+                            strike_map_c = {
+                                "ATM": spot, "+10%": spot*1.10, "+20%": spot*1.20,
+                                "+30%": spot*1.30, "+40%": spot*1.40, "+50%": spot*1.50,
+                                "-10%": spot*0.90, "-20%": spot*0.80, "-30%": spot*0.70,
+                                "-40%": spot*0.60, "-50%": spot*0.50,
+                                "ATM farther expiry": spot
+                            }
+                            K_leg  = strike_map_c.get(strike_lbl, spot)
+                            prem_c = black_scholes(spot, K_leg, T_yrs_c, r, sl_hv_lab, opt_t)
+                            sign   = "+" if direction == "buy" else "−"
+                            leg_rows.append({
+                                "Leg":     f"{direction.upper()} {qty}× {opt_t.upper()}",
+                                "Strike":  strike_lbl,
+                                "K ($)":   f"${K_leg:.5f}",
+                                "Premium": f"{sign}${prem_c:.6f}",
+                            })
+                        st.dataframe(pd.DataFrame(leg_rows), hide_index=True,
+                                     use_container_width=True)
+
+                with card_c3:
+                    # Payoff chart
+                    pr, pay, np_leg, _ = build_strategy_payoff(
+                        name, sdef, spot, sl_hv_lab, sl_T_lab / 365, r
+                    )
+                    if np.any(pay != 0):
+                        fig_card = go.Figure()
+                        fig_card.add_trace(go.Scatter(
+                            x=pr, y=pay, fill="tozeroy",
+                            fillcolor=f"rgba({int(sc_c[1:3],16)},{int(sc_c[3:5],16)},{int(sc_c[5:7],16)},0.06)",
+                            line=dict(color=sc_c, width=2),
+                            hovertemplate="Spot: $%{x:.5f}<br>P&L: $%{y:.6f}<extra></extra>"
+                        ))
+                        fig_card.add_hline(y=0, line_color="#3d6080", line_dash="dot")
+                        fig_card.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
+                                           annotation_text="S", annotation_font_size=9,
+                                           annotation_font_color="#ffffff")
+                        fig_card.update_layout(
+                            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+                            font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=9),
+                            xaxis=dict(gridcolor=_PLT_GRID, tickformat=".5f"),
+                            yaxis=dict(gridcolor=_PLT_GRID),
+                            height=200, showlegend=False,
+                            margin=dict(t=10, b=40, l=0, r=0)
+                        )
+                        st.plotly_chart(fig_card, use_container_width=True, key=_next_chart_key())
+                    else:
+                        st.caption("Schematic payoff — exotic structure")
+
+                    # USD notional impact
+                    if np_leg != 0:
+                        usd_cost = abs(np_leg) * sl_notional_lab / spot
+                        st.markdown(
+                            f'<div style="font-size:10px;color:#3d6080;text-align:center;">'
+                            f'Net: <span style="color:{("#ff4b6e" if np_leg < 0 else "#00e676")};">'
+                            f'{"−" if np_leg < 0 else "+"}${abs(np_leg):.6f}/unit · '
+                            f'${usd_cost:,.0f} on ${sl_notional_lab:,}</span></div>',
+                            unsafe_allow_html=True
+                        )
+
+        # ── OVERLAY: TOP 3 PAYOFFS COMPARED ─────────────────────────────
+        st.markdown('<div class="section-header">TOP 3 STRATEGIES — PAYOFF OVERLAY</div>',
+                    unsafe_allow_html=True)
+
+        overlay_palette = ["#00d4ff", "#00e676", "#f0a500", "#b388ff", "#ff8a65"]
+        S_rng_ov = np.linspace(spot * 0.35, spot * 2.60, 400)
+
+        fig_ov = go.Figure()
+        for oi, (oname, osc, _, odef) in enumerate(top_results[:3]):
+            pr_ov, pay_ov, _, _ = build_strategy_payoff(
+                oname, odef, spot, sl_hv_lab, sl_T_lab / 365, r
+            )
+            if np.any(pay_ov != 0):
+                # Interpolate to common range
+                pay_ov_interp = np.interp(S_rng_ov, pr_ov, pay_ov)
+                fig_ov.add_trace(go.Scatter(
+                    x=S_rng_ov, y=pay_ov_interp,
+                    name=f"#{oi+1} {oname} ({osc})",
+                    line=dict(color=overlay_palette[oi], width=2.5),
+                    hovertemplate=f"<b>{oname}</b><br>Spot: $%{{x:.5f}}<br>P&L: $%{{y:.6f}}<extra></extra>"
+                ))
+
+        fig_ov.add_hline(y=0, line_color="#3d6080", line_dash="dot")
+        fig_ov.add_vline(x=spot, line_color="#ffffff", line_dash="dash",
+                         annotation_text="CURRENT SPOT", annotation_font_color="#ffffff")
+        fig_ov.update_layout(
+            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+            font=dict(family="IBM Plex Mono", color=_PLT_TXT, size=10),
+            xaxis=dict(gridcolor=_PLT_GRID, title="Spot at Expiry ($)", tickformat=".5f"),
+            yaxis=dict(gridcolor=_PLT_GRID, title="P&L per unit ($)"),
+            legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR, font=dict(size=10)),
+            height=380, margin=dict(t=10, b=50),
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_ov, use_container_width=True, key=_next_chart_key())
+
+        # ── MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES ────────────────
+        st.markdown('<div class="section-header">MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES (10,000 PATHS)</div>',
+                    unsafe_allow_html=True)
+        st.markdown(
+            '<div style="font-size:11px;color:#5a7a99;margin-bottom:12px;line-height:1.8;">'
+            'Simulates 10,000 GBM paths to compute expected P&L distributions for the top 3 strategies. '
+            'Uses the current vol and drift assumptions.</div>',
+            unsafe_allow_html=True
+        )
+
+        np.random.seed(2024)
+        n_mc_strat = 10_000
+        T_mc_strat = sl_T_lab / 365
+        Z_mc_strat = np.random.standard_normal(n_mc_strat)
+        S_mc_terminal = spot * np.exp((r - 0.5 * sl_hv_lab**2) * T_mc_strat + sl_hv_lab * np.sqrt(T_mc_strat) * Z_mc_strat)
+
+        mc_strat_cols = st.columns(min(3, len(top_results)))
+        for si, (sname, ssc, _, sdef) in enumerate(top_results[:3]):
+            pr_mc, pay_mc, nprem_mc, legs_mc = build_strategy_payoff(
+                sname, sdef, spot, sl_hv_lab, T_mc_strat, r
+            )
+            if np.any(pay_mc != 0) and len(pr_mc) > 0:
+                # Interpolate payoff at simulated terminal prices
+                pnl_sims = np.interp(S_mc_terminal, pr_mc, pay_mc)
+                mean_pnl = np.mean(pnl_sims)
+                p_profit = np.mean(pnl_sims > 0) * 100
+                var_95 = np.percentile(pnl_sims, 5)
+                best_95 = np.percentile(pnl_sims, 95)
+
+                with mc_strat_cols[si]:
+                    pnl_color = '#00e676' if mean_pnl > 0 else '#ff4b6e'
+                    st.markdown(f'''
+                    <div class="metric-card" style="border-left-color:{pnl_color}">
+                        <div class="metric-label">#{si+1} {sname}</div>
+                        <div class="metric-value" style="font-size:16px;color:{pnl_color};">E[P&L]: ${mean_pnl:.6f}</div>
+                        <div class="metric-sub">
+                            P(profit): {p_profit:.0f}% · VaR(5%): ${var_95:.6f} · Best(95%): ${best_95:.6f}
+                        </div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+
+                    # Mini histogram
+                    fig_mc_mini = go.Figure(go.Histogram(
+                        x=pnl_sims, nbinsx=40,
+                        marker_color=pnl_color, marker_line_width=0, opacity=0.7
+                    ))
+                    fig_mc_mini.add_vline(x=0, line_color='#ffffff', line_dash='dot')
+                    fig_mc_mini.add_vline(x=mean_pnl, line_color='#f0a500', line_dash='dash')
+                    fig_mc_mini.update_layout(
+                        plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+                        font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=9),
+                        xaxis=dict(gridcolor=_PLT_GRID, title='P&L ($)'),
+                        yaxis=dict(gridcolor=_PLT_GRID), showlegend=False,
+                        height=180, margin=dict(t=5, b=30, l=10, r=10)
+                    )
+                    st.plotly_chart(fig_mc_mini, use_container_width=True, key=_next_chart_key())
+
+        # ── FULL DEPOSITORY BROWSER ──────────────────────────────────────
+        st.markdown(
+            f'<div class="section-header">FULL STRATEGY DEPOSITORY — ALL {len(STRATEGY_DEPOSITORY)} STRATEGIES</div>',
+            unsafe_allow_html=True
+        )
+
+        dep_filter_col1, dep_filter_col2 = st.columns(2)
+        with dep_filter_col1:
+            dep_view_filter = st.multiselect(
+                "Filter by view",
+                ["bullish", "mildly bullish", "neutral", "bearish",
+                 "high vol", "structured", "all"],
+                default=["bullish", "mildly bullish", "neutral", "bearish",
+                         "high vol", "structured", "all"],
+                key="dep_view_filter"
+            )
+        with dep_filter_col2:
+            dep_tag_filter = st.multiselect(
+                "Filter by tag",
+                sorted(set(t for s in STRATEGY_DEPOSITORY.values() for t in s.get("tags", []))),
+                default=[],
+                key="dep_tag_filter"
+            )
+
+        # Build depository table
+        score_lookup = {name: sc for name, sc, _, _ in raw_results}
+        dep_rows = []
+        for strat_name, sdef in STRATEGY_DEPOSITORY.items():
+            view_match = any(vf in sdef["view"].lower() for vf in dep_view_filter) or not dep_view_filter
+            tag_match  = (not dep_tag_filter) or any(t in sdef.get("tags", []) for t in dep_tag_filter)
+            if not view_match or not tag_match:
+                continue
+
+            sc_val = score_lookup.get(strat_name, 0)
+            dep_rows.append({
+                "Strategy":    strat_name,
+                "View":        sdef["view"],
+                "Vol Bias":    sdef["vol_bias"],
+                "Max Gain":    sdef["max_gain"],
+                "Max Loss":    sdef["max_loss"],
+                "Complexity":  "●" * sdef["complexity"] + "○" * (5 - sdef["complexity"]),
+                "Tags":        ", ".join(sdef.get("tags", [])),
+                "Your Score":  sc_val,
+            })
+
+        dep_df = pd.DataFrame(dep_rows).sort_values("Your Score", ascending=False)
+        st.dataframe(dep_df, use_container_width=True, hide_index=True, height=460)
+
+        # Download button
+        csv_data = dep_df.to_csv(index=False).encode()
+        st.download_button(
+            "⬇️  Download full depository as CSV",
+            data=csv_data,
+            file_name=f"strategy_depository_{sl_token}_{sl_view.replace(' ','_')}.csv",
+            mime="text/csv",
+            key="dep_download"
+        )
+
+        # ── SCORING METHODOLOGY ──────────────────────────────────────────
+        with st.expander("ℹ️  How the scoring engine works"):
+            st.markdown(f'''
+            <div style="font-size:11px;color:#5a7a99;line-height:2.1;">
+                <strong style="color:#00d4ff;">View Alignment (0–35 pts × conviction scalar)</strong><br>
+                Perfect match = 35 × confidence. Neutral strategy in directional view = 15 pts.
+                Opposite view = −30 pts (hard penalty).<br><br>
+                <strong style="color:#00d4ff;">Vol Regime (0–25 pts)</strong><br>
+                Current HV = <strong style="color:{vol_color}">{sl_hv_lab:.0%} ({vol_label})</strong>.
+                Short-vol strategies score 25pts in high-IV, −15 in low-IV.
+                Long-vol strategies score 25pts in low-IV, −15 in high-IV.<br><br>
+                <strong style="color:#00d4ff;">Put/Call Ratio / Skew (0–15 pts)</strong><br>
+                PCR = <strong style="color:{pcr_color}">{sl_pcr_lab:.2f} ({pcr_label})</strong>.
+                High put skew boosts risk reversals and cash-secured puts.
+                Low PCR boosts debit call strategies.<br><br>
+                <strong style="color:#00d4ff;">Tenor Fit (0–10 pts)</strong><br>
+                Short tenor ({sl_T_lab}d) → income/theta strategies boosted.
+                Long tenor → long-vol and LEAP structures boosted.<br><br>
+                <strong style="color:#00d4ff;">Complexity Penalty (−8 pts)</strong><br>
+                Applied when conviction &lt; 50% and strategy complexity ≥ 4.
+                Don't run complex structures on weak conviction.<br><br>
+                <strong style="color:#00d4ff;">OTC Gate</strong><br>
+                Structured/OTC strategies score −20 if OTC toggle is off.
+            </div>
+            ''', unsafe_allow_html=True)
+
+    _strategy_lab_fragment()
