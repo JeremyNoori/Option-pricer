@@ -42,7 +42,7 @@ DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
 
 # ── Tokens to refresh ────────────────────────────────────────────
 TOKENS = {
-    "xdc-network":  "XDC",
+    "xdce-crowd-sale":  "XDC",
     "bitcoin":      "BTC",
     "ethereum":     "ETH",
     "hyperliquid":  "HYPE",
@@ -157,22 +157,6 @@ def refresh_price_history():
                     prices = None
             except Exception as e:
                 log(f"  CoinGecko history {ticker}/{days}d failed: {e}")
-
-            if prices is None:
-                try:
-                    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/historical"
-                    r = requests.get(url, headers=CMC_HEADERS,
-                                     params={"symbol": ticker, "convert": "USD",
-                                             "count": str(days), "interval": "daily"},
-                                     timeout=12)
-                    quotes = r.json()["data"]["quotes"]
-                    prices = [q["quote"]["USD"]["close"] for q in quotes]
-                    if len(prices) < 5:
-                        prices = None
-                    else:
-                        log(f"  {ticker}/{days}d: {len(prices)} pts (CMC fallback)")
-                except Exception:
-                    pass
 
             if prices:
                 try:
