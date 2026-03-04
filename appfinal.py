@@ -260,10 +260,10 @@ def cached_fear_greed(days=30):
     return result
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def cached_deribit_index(currency):
-    """Deribit index: DB (2min) → live API."""
-    db = _db_get(f"deribit_index:{currency}", max_age_s=120)
+    """Deribit index: DB (1h) → live API."""
+    db = _db_get(f"deribit_index:{currency}", max_age_s=3600)
     if db is not None:
         return db
     try:
@@ -276,10 +276,10 @@ def cached_deribit_index(currency):
         return None
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def cached_deribit_book(currency):
-    """Deribit book: DB (2min) → live API."""
-    db = _db_get(f"deribit_book:{currency}", max_age_s=120)
+    """Deribit book: DB (1h) → live API."""
+    db = _db_get(f"deribit_book:{currency}", max_age_s=3600)
     if db is not None:
         return db
     try:
@@ -294,10 +294,10 @@ def cached_deribit_book(currency):
         return []
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def cached_deribit_dvol(currency, days=30):
-    """Deribit DVOL: DB (10min) → live API."""
-    db = _db_get(f"deribit_dvol:{currency}:{days}", max_age_s=600)
+    """Deribit DVOL: DB (1h) → live API."""
+    db = _db_get(f"deribit_dvol:{currency}:{days}", max_age_s=3600)
     if db is not None:
         return db
     try:
