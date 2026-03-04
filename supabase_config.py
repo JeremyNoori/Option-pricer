@@ -75,7 +75,6 @@ CREATE POLICY "Allow all" ON strategy_results FOR ALL USING (true);
 """
 
 import os
-import streamlit as st
 
 # Supabase client initialization
 _supabase_client = None
@@ -90,11 +89,12 @@ def get_supabase_client():
     url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY", "")
 
-    # Try Streamlit secrets (may not exist if not configured)
+    # Try Streamlit secrets (lazy import to avoid SessionInfo errors)
     if not url or not key:
         try:
-            url = url or st.secrets.get("SUPABASE_URL", "")
-            key = key or st.secrets.get("SUPABASE_KEY", "")
+            import streamlit as _st
+            url = url or _st.secrets.get("SUPABASE_URL", "")
+            key = key or _st.secrets.get("SUPABASE_KEY", "")
         except Exception:
             pass
 
@@ -105,11 +105,7 @@ def get_supabase_client():
         from supabase import create_client
         _supabase_client = create_client(url, key)
         return _supabase_client
-    except ImportError:
-        st.warning("supabase package not installed. Run: pip install supabase")
-        return None
-    except Exception as e:
-        st.error(f"Supabase connection failed: {e}")
+    except Exception:
         return None
 
 
