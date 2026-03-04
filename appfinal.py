@@ -11,19 +11,78 @@ import requests
 import time as _time_mod
 
 # Supabase backend (optional — gracefully degrades if not configured)
+# NOTE: Do NOT call get_supabase_client() at import time — st.secrets
+# is unavailable before the Streamlit runtime initialises, causing
+# "Tried to use SessionInfo before it was initialized".
 try:
     from supabase_config import (
         get_supabase_client, save_quote, save_vol_snapshot,
         save_strategy_result, load_quotes, load_vol_history
     )
-    _SUPABASE_AVAILABLE = get_supabase_client() is not None
-except Exception:
-    _SUPABASE_AVAILABLE = False
+    _SUPABASE_IMPORTS_OK = True
+except ImportError:
+    _SUPABASE_IMPORTS_OK = False
+
+
+def _is_supabase_available():
+    """Lazy check — only probes Supabase after Streamlit is running."""
+    if not _SUPABASE_IMPORTS_OK:
+        return False
+    try:
+        return get_supabase_client() is not None
+    except Exception:
+        return False
 import json
 from datetime import datetime, timedelta
 import warnings
 import math
 warnings.filterwarnings('ignore')
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  API KEYS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COINGECKO_API_KEY = "CG-V6cHxSdrovx4eoExmoUAEcsw"
+CMC_API_KEY       = "77e9e49f6c124981973dff95ec600d7e"
+
+# CoinGecko Demo-tier header (sent with every request)
+_CG_HEADERS = {
+    "accept": "application/json",
+    "x-cg-demo-api-key": COINGECKO_API_KEY,
+}
+
+# CoinMarketCap header
+_CMC_HEADERS = {
+    "X-CMC_PRO_API_KEY": CMC_API_KEY,
+    "Accept": "application/json",
+}
+
+# CoinGecko ID → CMC slug mapping (for fallback)
+_CG_TO_CMC_SLUG = {
+    "bitcoin":      "BTC",
+    "ethereum":     "ETH",
+    "xdc-network":  "XDC",
+    "hyperliquid":  "HYPE",
+    "solana":       "SOL",
+}
+
+
+def _cg_get(url, timeout=8):
+    """CoinGecko GET with API key header."""
+    return requests.get(url, headers=_CG_HEADERS, timeout=timeout)
+
+
+def _cmc_price(symbol):
+    """Fallback: fetch latest USD price from CoinMarketCap."""
+    try:
+        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+        r = requests.get(url, headers=_CMC_HEADERS,
+                         params={"symbol": symbol.upper(), "convert": "USD"},
+                         timeout=8)
+        data = r.json()
+        return data["data"][symbol.upper()]["quote"]["USD"]["price"]
+    except Exception:
+        return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -441,14 +500,17 @@ def monte_carlo_price(S, K, T, r, sigma, option_type='call', n_sims=50000, seed=
 
 
 def _fetch_xdc_price_raw():
-    """Raw XDC price fetch from CoinGecko."""
+    """Raw XDC price fetch from CoinGecko, CMC fallback."""
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=xdc-network&vs_currencies=usd"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        return data.get('xdc-network', {}).get('usd', None)
-    except:
-        return None
+        r = _cg_get(url, timeout=5)
+        price = r.json().get('xdc-network', {}).get('usd', None)
+        if price is not None:
+            return price
+    except Exception:
+        pass
+    # Fallback to CoinMarketCap
+    return _cmc_price("XDC")
 
 
 def fetch_xdc_price():
@@ -466,7 +528,7 @@ def _fetch_xdc_history_raw():
     """Raw 90d XDC history fetch."""
     try:
         url = "https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days=90&interval=daily"
-        r = requests.get(url, timeout=8)
+        r = _cg_get(url)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
         return prices if len(prices) > 5 else None
@@ -493,7 +555,7 @@ def _fetch_eth_history_raw(days=90):
     """Raw ETH history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = requests.get(url, timeout=8)
+        r = _cg_get(url)
         data = r.json()
         return [p[1] for p in data.get('prices', [])]
     except:
@@ -548,7 +610,7 @@ def _fetch_btc_history_raw(days=90):
     """Raw BTC history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = requests.get(url, timeout=8)
+        r = _cg_get(url)
         data = r.json()
         return [p[1] for p in data.get('prices', [])]
     except:
@@ -570,7 +632,7 @@ def _fetch_xdc_extended_raw(days=180):
     """Raw extended XDC history fetch."""
     try:
         url = f"https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days={days}&interval=daily"
-        r = requests.get(url, timeout=8)
+        r = _cg_get(url)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
         volumes = [p[1] for p in data.get('total_volumes', [])]
@@ -594,7 +656,7 @@ def _fetch_xdc_market_data_raw():
     """Raw XDC market data fetch."""
     try:
         url = "https://api.coingecko.com/api/v3/coins/xdc-network?localization=false&tickers=false&community_data=true&developer_data=false"
-        r = requests.get(url, timeout=8)
+        r = _cg_get(url)
         data = r.json()
         md = data.get('market_data', {})
         sentiment = data.get('sentiment_votes_up_percentage', None)
@@ -1211,18 +1273,24 @@ with st.sidebar:
 
     if coin_id is not None:
         with st.spinner(f"Fetching {token_ticker} price..."):
+            live_price = None
+            # Try CoinGecko (with API key)
             try:
                 _url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-                _r = requests.get(_url, timeout=5)
+                _r = _cg_get(_url, timeout=5)
                 live_price = _r.json().get(coin_id, {}).get("usd", None)
             except Exception:
-                live_price = None
+                pass
+            # Fallback: CoinMarketCap
+            if live_price is None:
+                _cmc_sym = _CG_TO_CMC_SLUG.get(coin_id, token_ticker)
+                live_price = _cmc_price(_cmc_sym)
         if live_price:
             st.success(f"Live {token_ticker}: ${live_price:,.4f}")
             spot = st.number_input("Spot Override ($)", value=float(live_price),
                                    format="%.6f" if live_price < 1 else "%.2f")
         else:
-            st.warning("CoinGecko unavailable — enter manually")
+            st.warning("Price API unavailable — enter manually")
             spot = st.number_input("Spot Price ($)", value=float(token_default_price),
                                    format="%.6f" if token_default_price < 1 else "%.2f")
     else:
@@ -1246,7 +1314,7 @@ with st.sidebar:
         with st.spinner("Fetching 90d history..."):
             try:
                 _vurl = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
-                _vr   = requests.get(_vurl, timeout=8)
+                _vr   = _cg_get(_vurl)
                 price_hist = [p[1] for p in _vr.json().get("prices", [])]
                 price_hist = price_hist if len(price_hist) > 5 else None
             except Exception:
@@ -1268,7 +1336,7 @@ with st.sidebar:
         with st.spinner("Fetching history..."):
             try:
                 _vurl2   = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
-                _vr2     = requests.get(_vurl2, timeout=8)
+                _vr2     = _cg_get(_vurl2)
                 price_hist = [p[1] for p in _vr2.json().get("prices", [])]
                 price_hist = price_hist if len(price_hist) > 5 else None
             except Exception:
@@ -2122,7 +2190,7 @@ with tab5:
         _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
         try:
             _mdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_md}/market_chart?vs_currency=usd&days=180&interval=daily"
-            _mdr   = requests.get(_mdurl, timeout=8)
+            _mdr   = _cg_get(_mdurl)
             _mddata = _mdr.json()
             xdc_prices_ext = [p[1] for p in _mddata.get("prices", [])]
             xdc_volumes    = [p[1] for p in _mddata.get("total_volumes", [])]
@@ -2135,7 +2203,7 @@ with tab5:
         _cid_mkd = _cid_mkd if _cid_mkd != "custom" else "xdc-network"
         try:
             _mkdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_mkd}?localization=false&tickers=false&community_data=true&developer_data=false"
-            _mkdr   = requests.get(_mkdurl, timeout=8)
+            _mkdr   = _cg_get(_mkdurl)
             _mkdd   = _mkdr.json()
             _mkdmd  = _mkdd.get("market_data", {})
             mkt_data = {
@@ -2751,8 +2819,8 @@ with tab6:
     
     sources = [
         ("SPOT PRICE", [
-            ("CoinGecko API", "Free, no key. /simple/price endpoint. Used in this tool.", "https://api.coingecko.com/api/v3/"),
-            ("CoinMarketCap", "Free tier 333 calls/day. Better for volume/market cap.", "https://coinmarketcap.com/api/"),
+            ("CoinGecko API", "Demo key integrated. /simple/price endpoint. Primary source.", "https://api.coingecko.com/api/v3/"),
+            ("CoinMarketCap", "Pro key integrated. Automatic fallback when CoinGecko fails.", "https://pro-api.coinmarketcap.com/v1/"),
             ("GeckoTerminal", "DEX pool prices in real-time. Good for XDC/USDT pairs.", "https://api.geckoterminal.com/api/v2/"),
             ("XDC Network RPC", "Direct on-chain. Query validator node for DEX AMM prices.", "https://rpc.xinfin.network"),
         ]),
@@ -3831,7 +3899,7 @@ with tab9:
     if _vs_hist_key not in st.session_state or refresh_btn:
         try:
             _vs_hist_url = f"https://api.coingecko.com/api/v3/coins/{_cid_vs}/market_chart?vs_currency=usd&days=365&interval=daily"
-            _vs_hist_r = requests.get(_vs_hist_url, timeout=10)
+            _vs_hist_r = _cg_get(_vs_hist_url, timeout=10)
             _vs_hist_data = _vs_hist_r.json()
             st.session_state[_vs_hist_key] = [p[1] for p in _vs_hist_data.get("prices", [])]
         except Exception:
@@ -4371,7 +4439,8 @@ def score_strategies(view, confidence, hv, pcr, T_days, spot, sigma, is_otc_ok=T
     Returns sorted list of (strategy_name, score, reasoning).
     """
     results = []
-    conf = confidence / 100  # 0-1
+    # confidence is already 0-1 (pre-scaled by caller with conviction × scalar)
+    conf = max(0.0, min(1.0, float(confidence)))
 
     # Vol regime
     vol_high  = hv > 0.70   # high IV → prefer short-vol structures
@@ -4400,10 +4469,10 @@ def score_strategies(view, confidence, hv, pcr, T_days, spot, sigma, is_otc_ok=T
                 score += 15 * conf
                 reasons.append("Neutral strategy — partial fit for bullish view")
             elif "bearish" in sview:
-                score -= 30
-                reasons.append("⚠️ View misaligned (bearish strategy)")
-            elif "high vol" in sview:
-                score += 10
+                score -= 30 * conf
+                reasons.append("View misaligned (bearish strategy)")
+            if "high vol" in sview:
+                score += 10 * conf
         elif view == "bearish":
             if "bearish" in sview:
                 score += 35 * conf
@@ -4412,14 +4481,14 @@ def score_strategies(view, confidence, hv, pcr, T_days, spot, sigma, is_otc_ok=T
                 score += 15 * conf
                 reasons.append("Neutral strategy — partial fit for bearish view")
             elif "bullish" in sview:
-                score -= 30
-                reasons.append("⚠️ View misaligned (bullish strategy)")
+                score -= 30 * conf
+                reasons.append("View misaligned (bullish strategy)")
         elif view == "neutral":
             if "neutral" in sview:
                 score += 35 * conf
                 reasons.append(f"View aligned ({strat['view']})")
             elif "bullish" in sview or "bearish" in sview:
-                score -= 10
+                score -= 10 * conf
                 reasons.append("Directional strategy — suboptimal for neutral view")
             if "high vol" in sview:
                 score += 10 * conf
