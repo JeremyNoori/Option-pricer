@@ -8,6 +8,16 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import requests
+
+# Supabase backend (optional — gracefully degrades if not configured)
+try:
+    from supabase_config import (
+        get_supabase_client, save_quote, save_vol_snapshot,
+        save_strategy_result, load_quotes, load_vol_history
+    )
+    _SUPABASE_AVAILABLE = get_supabase_client() is not None
+except ImportError:
+    _SUPABASE_AVAILABLE = False
 import json
 from datetime import datetime, timedelta
 import warnings
@@ -362,10 +372,10 @@ def monte_carlo_price(S, K, T, r, sigma, option_type='call', n_sims=50000, seed=
 def fetch_xdc_price():
     """Try to fetch XDC price from CoinGecko (free, no key needed)."""
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=xdce-crowd-sale&vs_currencies=usd"
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=xdc-network&vs_currencies=usd"
         r = requests.get(url, timeout=5)
         data = r.json()
-        return data.get('xdce-crowd-sale', {}).get('usd', None)
+        return data.get('xdc-network', {}).get('usd', None)
     except:
         return None
 
@@ -373,7 +383,7 @@ def fetch_xdc_price():
 def fetch_xdc_history():
     """Fetch 90d XDC price history from CoinGecko."""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/xdce-crowd-sale/market_chart?vs_currency=usd&days=90&interval=daily"
+        url = "https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days=90&interval=daily"
         r = requests.get(url, timeout=8)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
@@ -404,11 +414,21 @@ def fetch_fear_greed(days=30):
     """
     try:
         url = f"https://api.alternative.me/fng/?limit={days}&format=json"
-        r = requests.get(url, timeout=6)
+        r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code != 200:
+            return None
         data = r.json()
         entries = data.get('data', [])
-        return [(int(e['timestamp']), int(e['value']), e['value_classification']) for e in entries]
-    except:
+        if not entries:
+            return None
+        result = []
+        for e in entries:
+            try:
+                result.append((int(e['timestamp']), int(e['value']), e.get('value_classification', 'Unknown')))
+            except (ValueError, KeyError):
+                continue
+        return result if result else None
+    except Exception:
         return None
 
 def fetch_btc_history(days=90):
@@ -424,7 +444,7 @@ def fetch_btc_history(days=90):
 def fetch_xdc_extended(days=180):
     """Fetch extended XDC history for regime detection."""
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/xdce-crowd-sale/market_chart?vs_currency=usd&days={days}&interval=daily"
+        url = f"https://api.coingecko.com/api/v3/coins/xdc-network/market_chart?vs_currency=usd&days={days}&interval=daily"
         r = requests.get(url, timeout=8)
         data = r.json()
         prices = [p[1] for p in data.get('prices', [])]
@@ -436,7 +456,7 @@ def fetch_xdc_extended(days=180):
 def fetch_xdc_market_data():
     """Fetch market cap, volume, sentiment proxies."""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/xdce-crowd-sale?localization=false&tickers=false&community_data=true&developer_data=false"
+        url = "https://api.coingecko.com/api/v3/coins/xdc-network?localization=false&tickers=false&community_data=true&developer_data=false"
         r = requests.get(url, timeout=8)
         data = r.json()
         md = data.get('market_data', {})
@@ -663,38 +683,65 @@ def compute_price_scenarios(spot, distributions):
 
 def fit_garch11(log_rets, horizon=30):
     """
-    GARCH(1,1) vol forecast.
-    ω + α*ε²(t-1) + β*σ²(t-1)
-    Uses MLE estimation approximated by moments method.
+    GARCH(1,1) vol forecast with MLE parameter estimation.
+    σ²(t) = ω + α*ε²(t-1) + β*σ²(t-1)
+    Uses scipy.optimize.minimize to find optimal (ω, α, β).
     Returns daily vol forecast for each of `horizon` days.
     """
-    # Estimate parameters via method of moments (fast, no optimizer needed)
     n = len(log_rets)
-    r2 = log_rets**2
-    
-    # Simple moment-based GARCH(1,1) starting values
-    omega = np.var(log_rets) * 0.05
-    alpha = 0.10
-    beta  = 0.85
-    
-    # Filter: get conditional variance series
+    var_baseline = np.var(log_rets)
+
+    def garch_loglik(params, returns):
+        omega, alpha, beta = params
+        n_ = len(returns)
+        sigma2 = np.zeros(n_)
+        sigma2[0] = var_baseline
+        for i in range(1, n_):
+            sigma2[i] = omega + alpha * returns[i-1]**2 + beta * sigma2[i-1]
+            sigma2[i] = max(sigma2[i], 1e-12)
+        # Negative log-likelihood (Gaussian)
+        ll = -0.5 * np.sum(np.log(sigma2[1:]) + returns[1:]**2 / sigma2[1:])
+        return -ll  # minimize negative LL
+
+    # Starting values
+    x0 = [var_baseline * 0.05, 0.10, 0.85]
+    bounds = [(1e-10, var_baseline * 5), (1e-6, 0.5), (0.3, 0.999)]
+
+    # Constraint: alpha + beta < 1 (stationarity)
+    constraints = [{'type': 'ineq', 'fun': lambda p: 0.999 - p[1] - p[2]}]
+
+    try:
+        result = minimize(
+            garch_loglik, x0, args=(log_rets,),
+            method='SLSQP', bounds=bounds, constraints=constraints,
+            options={'maxiter': 500, 'ftol': 1e-10}
+        )
+        if result.success:
+            omega, alpha, beta = result.x
+        else:
+            omega, alpha, beta = x0
+    except Exception:
+        omega, alpha, beta = x0
+
+    # Filter: compute conditional variance series with estimated params
     sigma2 = np.zeros(n)
-    sigma2[0] = np.var(log_rets)
+    sigma2[0] = var_baseline
     for i in range(1, n):
         sigma2[i] = omega + alpha * log_rets[i-1]**2 + beta * sigma2[i-1]
-    
+        sigma2[i] = max(sigma2[i], 1e-12)
+
     # Forecast h steps ahead
     last_eps2  = log_rets[-1]**2
     last_sig2  = sigma2[-1]
     persist    = alpha + beta
     long_run   = omega / max(1 - persist, 1e-6)
-    
+
     forecasts = []
     sig2_fwd = last_sig2
     for h in range(1, horizon + 1):
-        sig2_fwd = omega + (alpha + beta) * sig2_fwd
+        sig2_fwd = omega + persist * sig2_fwd
         forecasts.append(np.sqrt(sig2_fwd * 365))  # annualised
-    
+
     return {
         'omega': omega, 'alpha': alpha, 'beta': beta,
         'persistence': persist,
@@ -787,18 +834,21 @@ def project_distributions_30d_enhanced(
     beta_g  = garch_result['beta']
     
     # Simulate n_sims paths of 30 days
-    sig2_t  = garch_result['sigma2_series'][-1]  # start from last observed
+    sig2_t  = np.full(n_sims, garch_result['sigma2_series'][-1])  # start from last observed
     S_paths = np.ones(n_sims) * spot
     daily_mu_garch = mu_hist / 365
-    
+    prev_eps = np.zeros(n_sims)  # previous innovation for GARCH update
+
     for d in range(n_days):
-        # GARCH vol update
-        sig2_t = omega_g + alpha_g * (S_paths/spot * 0)**2 + beta_g * sig2_t  # simplified daily
-        sig_t  = np.sqrt(sig2_t)
         # Skew-normal innovations
         eps = skewnorm.rvs(a=a_sn, loc=0, scale=scale_sn, size=n_sims)
+        # GARCH vol update: σ²(t) = ω + α*ε²(t-1) + β*σ²(t-1)
+        sig2_t = omega_g + alpha_g * prev_eps**2 + beta_g * sig2_t
+        sig2_t = np.maximum(sig2_t, 1e-12)
+        sig_t  = np.sqrt(sig2_t)
+        prev_eps = sig_t * eps  # store scaled innovation for next step
         S_paths = S_paths * np.exp(daily_mu_garch - 0.5 * sig_t**2 + sig_t * eps)
-    
+
     S_garch = S_paths
 
     return {
@@ -1000,7 +1050,7 @@ with st.sidebar:
 
     # ── Token selector ──────────────────────────────────
     TOKENS = {
-        "XDC  — XDC Network":    ("xdce-crowd-sale",        "XDC",   0.035),
+        "XDC  — XDC Network":    ("xdc-network",        "XDC",   0.035),
         "BTC  — Bitcoin":        ("bitcoin",                "BTC",   65000.0),
         "ETH  — Ethereum":       ("ethereum",               "ETH",   3500.0),
         "HYPE — Hyperliquid":    ("hyperliquid",            "HYPE",  20.0),
@@ -1042,8 +1092,8 @@ with st.sidebar:
         iv_spread = st.slider("OTC IV Spread (add to HV)", 0.0, 0.30, 0.10, 0.01)
         sigma = hv + iv_spread
     elif "Auto from" in vol_mode:
-        _cid_vol = st.session_state.get("active_coin_id", "xdce-crowd-sale")
-        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdce-crowd-sale"
+        _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
+        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
         with st.spinner("Fetching 90d history..."):
             try:
                 _vurl = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
@@ -1064,8 +1114,8 @@ with st.sidebar:
         iv_spread = st.slider("OTC Spread", 0.0, 0.30, 0.10, 0.01)
         sigma = hv + iv_spread
     else:  # EWMA
-        _cid_vol = st.session_state.get("active_coin_id", "xdce-crowd-sale")
-        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdce-crowd-sale"
+        _cid_vol = st.session_state.get("active_coin_id", "xdc-network")
+        _cid_vol = _cid_vol if _cid_vol != "custom" else "xdc-network"
         with st.spinner("Fetching history..."):
             try:
                 _vurl2   = f"https://api.coingecko.com/api/v3/coins/{_cid_vol}/market_chart?vs_currency=usd&days=90&interval=daily"
@@ -1108,10 +1158,7 @@ with st.sidebar:
     else:
         lam_j, mu_j, sig_j = 0.5, -0.10, 0.20
 
-    st.markdown('<div class="section-header">STRUCTURED PRODUCTS</div>', unsafe_allow_html=True)
-    barrier_pct  = st.slider("Snowball Barrier (%)", 80, 130, 100)
-    coupon_rate  = st.slider("Snowball Coupon / Period (%)", 1.0, 20.0, 8.0, 0.5) / 100
-    T_periods    = st.slider("Snowball Periods", 1, 12, 4)
+    # Snowball params moved to Structures tab (tab4)
 
 
 # ─────────────────────────────────────────────
@@ -1484,26 +1531,37 @@ with tab2:
     )
     st.plotly_chart(fig_payoff, use_container_width=True, key=_next_chart_key())
 
-    # Vol smile
+    # Vol smile — scrollable container to avoid oversized chart at top bracket
     st.markdown('<div class="section-header">IMPLIED VOL SMILE (OTC PRICING)</div>', unsafe_allow_html=True)
-    iv_smile = [sigma * (1 + 0.05 * abs(o - 1) + 0.03 * (o - 1)) for o in strike_offsets]
+
+    # Expanded strike range for higher-resolution smile
+    smile_offsets = np.arange(0.50, 1.81, 0.05)
+    smile_labels  = [f"{(o-1)*100:+.0f}%" for o in smile_offsets]
+    iv_smile = [sigma * (1 + 0.08 * abs(o - 1)**1.2 + 0.04 * (o - 1)) for o in smile_offsets]
+
     fig_smile = go.Figure()
     fig_smile.add_trace(go.Scatter(
-        x=strike_labels, y=[v * 100 for v in iv_smile],
+        x=smile_labels, y=[v * 100 for v in iv_smile],
         line=dict(color='#00d4ff', width=2.5),
         fill='tozeroy', fillcolor='rgba(0,212,255,0.05)',
-        name='OTC IV'
+        name='OTC IV',
+        hovertemplate="Strike: %{x}<br>IV: %{y:.1f}%<extra></extra>"
     ))
     fig_smile.add_hline(y=hv * 100, line_dash="dot", line_color="#f0a500",
                          annotation_text=f"HV {hv:.0%}", annotation_font_color="#f0a500")
     fig_smile.update_layout(
         plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
         font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=11),
-        xaxis=dict(gridcolor=_PLT_GRID),
-        yaxis=dict(gridcolor=_PLT_GRID, title='Implied Vol (%)'),
-        height=280, margin=dict(t=10, b=40)
+        xaxis=dict(gridcolor=_PLT_GRID, title='Strike (% from ATM)',
+                   rangeslider=dict(visible=True, thickness=0.08)),
+        yaxis=dict(gridcolor=_PLT_GRID, title='Implied Vol (%)',
+                   fixedrange=False),
+        height=360, margin=dict(t=10, b=40),
+        dragmode='pan',
     )
-    st.plotly_chart(fig_smile, use_container_width=True, key=_next_chart_key())
+    config_smile = {'scrollZoom': True, 'displayModeBar': True}
+    st.plotly_chart(fig_smile, use_container_width=True, key=_next_chart_key(),
+                    config=config_smile)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1563,9 +1621,9 @@ with tab3:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab4:
     recs = recommend_structure(hv, spot, call_prices, put_prices, strikes, T)
-    
+
     st.markdown('<div class="section-header">STRATEGY RECOMMENDATION ENGINE</div>', unsafe_allow_html=True)
-    
+
     for rec in recs:
         st.markdown(f'''
         <div class="recommendation-box" style="border-left-color:{rec["color"]}">
@@ -1577,12 +1635,20 @@ with tab4:
             <div style="font-size:11px;color:#5a7a99;">⚠ Risk: {rec["risk"]}</div>
         </div>
         ''', unsafe_allow_html=True)
-    
-    # ── SNOWBALL ANALYSIS
+
+    # ── SNOWBALL AUTOCALLABLE — parameters now in Structures tab
     st.markdown('<div class="section-header" style="margin-top:28px;">SNOWBALL AUTOCALLABLE</div>', unsafe_allow_html=True)
-    
+
+    sb_param_cols = st.columns(3)
+    with sb_param_cols[0]:
+        barrier_pct = st.slider("Snowball Barrier (%)", 80, 130, 100, key="sb_barrier")
+    with sb_param_cols[1]:
+        coupon_rate = st.slider("Coupon / Period (%)", 1.0, 20.0, 8.0, 0.5, key="sb_coupon") / 100
+    with sb_param_cols[2]:
+        T_periods = st.slider("Snowball Periods", 1, 12, 4, key="sb_periods")
+
     barrier = spot * barrier_pct / 100
-    
+
     snowball_cols = st.columns(3)
     with snowball_cols[0]:
         st.markdown(f'''<div class="metric-card neutral">
@@ -1605,15 +1671,15 @@ with tab4:
             <div class="metric-value">{worst_case:.2f}%</div>
             <div class="metric-sub">Cost of embedded put = max downside</div>
         </div>''', unsafe_allow_html=True)
-    
-    # Snowball MC simulation
-    st.markdown("**Monte Carlo Snowball Outcomes**")
+
+    # Snowball MC simulation — 10,000 paths
+    st.markdown("**Monte Carlo Snowball Outcomes (10,000 paths)**")
     np.random.seed(42)
-    n_sims = 10000
+    n_sims_sb = 10_000
     outcomes = []
     period_len = T / T_periods
-    
-    for _ in range(n_sims):
+
+    for _ in range(n_sims_sb):
         path_spots = [spot]
         for p in range(T_periods):
             z = np.random.normal()
@@ -1621,9 +1687,9 @@ with tab4:
             path_spots.append(next_s)
         payout = snowball_payoff(path_spots[1:], spot, barrier, coupon_rate, T_periods)
         outcomes.append(payout * 100)
-    
+
     outcomes = np.array(outcomes)
-    
+
     fig_sb = go.Figure()
     fig_sb.add_trace(go.Histogram(
         x=outcomes, nbinsx=60,
@@ -1640,16 +1706,141 @@ with tab4:
         height=300, margin=dict(t=20, b=40)
     )
     st.plotly_chart(fig_sb, use_container_width=True, key=_next_chart_key())
-    
+
     prob_pos = np.mean(outcomes > 0) * 100
     st.markdown(f'''
     <div class="warning-box">
-        Snowball stats: Mean return = <strong>{np.mean(outcomes):.1f}%</strong> 
+        Snowball stats: Mean return = <strong>{np.mean(outcomes):.1f}%</strong>
         &nbsp;|&nbsp; P(positive) = <strong>{prob_pos:.0f}%</strong>
         &nbsp;|&nbsp; Worst 5% = <strong>{np.percentile(outcomes, 5):.1f}%</strong>
         &nbsp;|&nbsp; Best 5% = <strong>{np.percentile(outcomes, 95):.1f}%</strong>
     </div>
     ''', unsafe_allow_html=True)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  MONTE CARLO SNOWBALL STRUCTURE EXPLORER
+    #  Simulates different barrier/coupon/period combinations
+    # ══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="section-header" style="margin-top:28px;">SNOWBALL STRUCTURE EXPLORER — MONTE CARLO COMPARISON</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:11px;color:#5a7a99;margin-bottom:14px;line-height:1.8;">'
+        'Compare snowball autocallable structures with different barriers, coupons, and periods. '
+        'Each configuration runs 10,000 Monte Carlo paths to compute P&L statistics.</div>',
+        unsafe_allow_html=True
+    )
+
+    # Configuration controls
+    mc_exp_cols = st.columns(3)
+    with mc_exp_cols[0]:
+        barriers_input = st.multiselect(
+            "Barriers to test (%)",
+            options=[80, 85, 90, 95, 100, 105, 110, 120, 130],
+            default=[85, 95, 100, 110],
+            key="mc_barriers"
+        )
+    with mc_exp_cols[1]:
+        coupons_input = st.multiselect(
+            "Coupons to test (%/period)",
+            options=[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0],
+            default=[4.0, 8.0, 12.0],
+            key="mc_coupons"
+        )
+    with mc_exp_cols[2]:
+        periods_input = st.multiselect(
+            "Periods to test",
+            options=[2, 3, 4, 6, 8, 12],
+            default=[3, 4, 6],
+            key="mc_periods"
+        )
+
+    if barriers_input and coupons_input and periods_input:
+        mc_explorer_results = []
+        np.random.seed(123)
+        n_mc_exp = 10_000
+
+        with st.spinner(f"Running {len(barriers_input)*len(coupons_input)*len(periods_input)} snowball structures × {n_mc_exp:,} paths..."):
+            for b_pct in barriers_input:
+                for c_pct in coupons_input:
+                    for n_p in periods_input:
+                        b_level = spot * b_pct / 100
+                        c_rate  = c_pct / 100
+                        pl_len  = T / n_p
+                        outs = []
+                        for _ in range(n_mc_exp):
+                            path = [spot]
+                            for _ in range(n_p):
+                                z = np.random.normal()
+                                ns = path[-1] * np.exp((r - 0.5*sigma**2)*pl_len + sigma*np.sqrt(pl_len)*z)
+                                path.append(ns)
+                            pay = snowball_payoff(path[1:], spot, b_level, c_rate, n_p)
+                            outs.append(pay * 100)
+                        outs = np.array(outs)
+                        mc_explorer_results.append({
+                            'Barrier (%)':   b_pct,
+                            'Coupon (%/P)':  c_pct,
+                            'Periods':       n_p,
+                            'Mean Return':   f"{np.mean(outs):.1f}%",
+                            'P(Positive)':   f"{np.mean(outs > 0)*100:.0f}%",
+                            'Worst 5%':      f"{np.percentile(outs, 5):.1f}%",
+                            'Best 5%':       f"{np.percentile(outs, 95):.1f}%",
+                            'Sharpe-like':   f"{np.mean(outs)/max(np.std(outs),0.01):.2f}",
+                            'P(Autocall)':   f"{np.mean(outs >= c_pct)*100:.0f}%",
+                            '_mean_raw':     np.mean(outs),
+                        })
+
+        mc_exp_df = pd.DataFrame(mc_explorer_results)
+
+        # Results table
+        display_cols_mc = [c for c in mc_exp_df.columns if not c.startswith('_')]
+        st.dataframe(mc_exp_df[display_cols_mc].sort_values('_mean_raw', key=lambda s: mc_exp_df['_mean_raw'], ascending=False),
+                      use_container_width=True, hide_index=True)
+
+        # Heatmap of mean returns: barrier vs coupon
+        if len(barriers_input) >= 2 and len(coupons_input) >= 2:
+            # Use first period setting for heatmap
+            p_hm = periods_input[0]
+            hm_data = mc_exp_df[mc_exp_df['Periods'] == p_hm]
+            if not hm_data.empty:
+                pivot = hm_data.pivot_table(
+                    values='_mean_raw', index='Barrier (%)', columns='Coupon (%/P)'
+                )
+                fig_hm = go.Figure(data=go.Heatmap(
+                    z=pivot.values,
+                    x=[f"{c:.0f}%" for c in pivot.columns],
+                    y=[f"{b}%" for b in pivot.index],
+                    colorscale=[
+                        [0.0, '#ff4b6e'], [0.3, '#f0a500'],
+                        [0.5, '#1a2535'], [0.7, '#00d4ff'], [1.0, '#00e676']
+                    ],
+                    colorbar=dict(title='Mean Return %', tickfont=dict(color='#5a7a99')),
+                    hovertemplate='Barrier: %{y}<br>Coupon: %{x}<br>Mean: %{z:.1f}%<extra></extra>'
+                ))
+                fig_hm.update_layout(
+                    title=dict(text=f'Mean Return Heatmap ({p_hm} periods)', font=dict(size=11, color='#5a9abf')),
+                    plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+                    font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
+                    xaxis=dict(title='Coupon / Period'), yaxis=dict(title='Barrier'),
+                    height=320, margin=dict(t=40, b=40)
+                )
+                st.plotly_chart(fig_hm, use_container_width=True, key=_next_chart_key())
+
+        # Best structure highlight
+        best_idx = mc_exp_df['_mean_raw'].idxmax()
+        best = mc_exp_df.iloc[best_idx]
+        st.markdown(f'''
+        <div class="recommendation-box" style="border-left-color:#00e676">
+            <div style="font-family:Space Mono;font-size:14px;color:#00e676;margin-bottom:6px;">OPTIMAL SNOWBALL STRUCTURE</div>
+            <div style="font-size:12px;color:#8fb3d0;">
+                Barrier: <strong>{best["Barrier (%)"]:.0f}%</strong> ·
+                Coupon: <strong>{best["Coupon (%/P)"]:.0f}%/period</strong> ·
+                Periods: <strong>{best["Periods"]}</strong> ·
+                Mean Return: <strong>{best["Mean Return"]}</strong> ·
+                P(Positive): <strong>{best["P(Positive)"]}</strong>
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+    else:
+        st.info("Select at least one barrier, coupon, and period to run the explorer.")
     
     # ── LADDER
     st.markdown('<div class="section-header" style="margin-top:24px;">CALL LADDER (UPSIDE LOCKS)</div>', unsafe_allow_html=True)
@@ -1725,8 +1916,8 @@ with tab5:
 
     # ── DATA LOADING ──
     with st.spinner(f"Loading {st.session_state.get('active_token_ticker','XDC')} 180d + BTC + ETH + Fear & Greed..."):
-        _cid_md = st.session_state.get("active_coin_id", "xdce-crowd-sale")
-        _cid_md = _cid_md if _cid_md != "custom" else "xdce-crowd-sale"
+        _cid_md = st.session_state.get("active_coin_id", "xdc-network")
+        _cid_md = _cid_md if _cid_md != "custom" else "xdc-network"
         try:
             _mdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_md}/market_chart?vs_currency=usd&days=180&interval=daily"
             _mdr   = requests.get(_mdurl, timeout=8)
@@ -1738,8 +1929,8 @@ with tab5:
             xdc_prices_ext, xdc_volumes = None, None
         btc_prices  = fetch_btc_history(90)
         eth_prices  = fetch_eth_history(90)
-        _cid_mkd = st.session_state.get("active_coin_id", "xdce-crowd-sale")
-        _cid_mkd = _cid_mkd if _cid_mkd != "custom" else "xdce-crowd-sale"
+        _cid_mkd = st.session_state.get("active_coin_id", "xdc-network")
+        _cid_mkd = _cid_mkd if _cid_mkd != "custom" else "xdc-network"
         try:
             _mkdurl = f"https://api.coingecko.com/api/v3/coins/{_cid_mkd}?localization=false&tickers=false&community_data=true&developer_data=false"
             _mkdr   = requests.get(_mkdurl, timeout=8)
@@ -1834,16 +2025,50 @@ with tab5:
         </div>
         ''', unsafe_allow_html=True)
     with banner_cols[1]:
-        fg_display = fg_current if fg_current else 50
+        fg_display = fg_current if fg_current is not None else "N/A"
+        fg_display_label = fg_label if fg_current is not None else "API Unavailable"
         st.markdown(f'''
         <div style="background:#0d1117;border:1px solid {fg_color};border-radius:4px;
                     padding:16px;text-align:center;height:100%;">
             <div style="font-size:10px;letter-spacing:2px;color:#3d6080;margin-bottom:8px;">FEAR & GREED</div>
             <div style="font-family:Space Mono;font-size:36px;color:{fg_color};">{fg_display}</div>
-            <div style="font-size:11px;color:{fg_color};margin-top:4px;">{fg_label}</div>
+            <div style="font-size:11px;color:{fg_color};margin-top:4px;">{fg_display_label}</div>
             <div style="font-size:10px;color:#3d6080;margin-top:6px;">{fg_trend or "Source: alternative.me"}</div>
         </div>
         ''', unsafe_allow_html=True)
+
+    # Fear & Greed 30-day trend chart
+    if fg_data and len(fg_data) > 1:
+        fg_dates = [datetime.fromtimestamp(e[0]) for e in fg_data]
+        fg_vals  = [e[1] for e in fg_data]
+        fig_fg = go.Figure()
+        fig_fg.add_trace(go.Scatter(
+            x=fg_dates, y=fg_vals, name='Fear & Greed',
+            line=dict(width=2),
+            marker=dict(
+                color=[
+                    '#ff4b6e' if v < 25 else '#f0a500' if v < 50 else '#b3ff00' if v < 75 else '#00e676'
+                    for v in fg_vals
+                ],
+                size=6
+            ),
+            mode='lines+markers',
+            fill='tozeroy', fillcolor='rgba(0,212,255,0.03)',
+            hovertemplate='Date: %{x}<br>Score: %{y}<extra></extra>'
+        ))
+        fig_fg.add_hline(y=50, line_color='#3d6080', line_dash='dot')
+        fig_fg.add_hline(y=25, line_color='#ff4b6e', line_dash='dot',
+                          annotation_text='Extreme Fear', annotation_font_size=9)
+        fig_fg.add_hline(y=75, line_color='#00e676', line_dash='dot',
+                          annotation_text='Extreme Greed', annotation_font_size=9)
+        fig_fg.update_layout(
+            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+            font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
+            xaxis=dict(gridcolor=_PLT_GRID), yaxis=dict(gridcolor=_PLT_GRID, title='F&G Score', range=[0, 100]),
+            height=200, margin=dict(t=10, b=30), showlegend=False,
+            title=dict(text='Fear & Greed — 30 Day Trend', font=dict(size=10, color='#5a9abf'))
+        )
+        st.plotly_chart(fig_fg, use_container_width=True, key=_next_chart_key())
 
     # ── GARCH VOL FORECAST ──
     st.markdown('<div class="section-header" style="margin-top:20px;">GARCH(1,1) VOL FORECAST — NEXT 30 DAYS</div>', unsafe_allow_html=True)
@@ -1987,7 +2212,7 @@ with tab5:
 
     for model_name, sims in distributions.items():
         try:
-            kde = gaussian_kde(sims, bw_method=0.12)
+            kde = gaussian_kde(sims, bw_method='scott')
             density = kde(price_range)
             is_ens = model_name == 'Ensemble (Blended)'
             fig_dist.add_trace(go.Scatter(
@@ -2207,7 +2432,7 @@ with tab5:
     fig_cond = go.Figure()
     for scenario_label, sims in cond_dists.items():
         try:
-            kde = gaussian_kde(sims, bw_method=0.13)
+            kde = gaussian_kde(sims, bw_method='scott')
             density = kde(price_range)
             fig_cond.add_trace(go.Scatter(
                 x=price_range, y=density,
@@ -3393,6 +3618,103 @@ with tab9:
             fig_skew.update_yaxes(gridcolor=_PLT_GRID, title_text="IV (%)", row=1, col=c)
         st.plotly_chart(fig_skew, use_container_width=True, key=_next_chart_key())
 
+    # ── XDC HISTORICAL VOLATILITY SURFACE ─────────────────────────────
+    _active_tok_vs = st.session_state.get("active_token_ticker", "XDC")
+    st.markdown(f'<div class="section-header">{_active_tok_vs} HISTORICAL VOL ANALYSIS</div>', unsafe_allow_html=True)
+
+    # Fetch XDC historical data for vol computation
+    _cid_vs = st.session_state.get("active_coin_id", "xdc-network")
+    _cid_vs = _cid_vs if _cid_vs != "custom" else "xdc-network"
+    _vs_hist_key = f"vs_hist_{_cid_vs}"
+    if _vs_hist_key not in st.session_state or refresh_btn:
+        try:
+            _vs_hist_url = f"https://api.coingecko.com/api/v3/coins/{_cid_vs}/market_chart?vs_currency=usd&days=365&interval=daily"
+            _vs_hist_r = requests.get(_vs_hist_url, timeout=10)
+            _vs_hist_data = _vs_hist_r.json()
+            st.session_state[_vs_hist_key] = [p[1] for p in _vs_hist_data.get("prices", [])]
+        except Exception:
+            st.session_state[_vs_hist_key] = None
+
+    xdc_hist_prices = st.session_state.get(_vs_hist_key)
+
+    if xdc_hist_prices and len(xdc_hist_prices) > 30:
+        xdc_log_rets_vs = np.log(np.array(xdc_hist_prices[1:]) / np.array(xdc_hist_prices[:-1]))
+
+        # Compute rolling HV for multiple windows
+        windows = [7, 14, 30, 60, 90, 180]
+        hv_series = {}
+        for w in windows:
+            if len(xdc_log_rets_vs) >= w:
+                rolling_hv = []
+                for i in range(w, len(xdc_log_rets_vs)):
+                    window_rets = xdc_log_rets_vs[i-w:i]
+                    rolling_hv.append(np.std(window_rets) * np.sqrt(365) * 100)
+                hv_series[w] = rolling_hv
+
+        # Plot rolling HV
+        hv_palette = ['#00d4ff', '#00e676', '#f0a500', '#b388ff', '#ff8a65', '#e040fb']
+        fig_xdc_hv = go.Figure()
+        for i, (w, series) in enumerate(hv_series.items()):
+            fig_xdc_hv.add_trace(go.Scatter(
+                x=list(range(len(series))), y=series,
+                name=f'{w}d HV', line=dict(color=hv_palette[i % len(hv_palette)], width=2 if w == 30 else 1.2),
+                opacity=1.0 if w == 30 else 0.7,
+                hovertemplate=f'{w}d HV: %{{y:.1f}}%<extra></extra>'
+            ))
+        fig_xdc_hv.update_layout(
+            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+            font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
+            xaxis=dict(gridcolor=_PLT_GRID, title='Days (most recent right)'),
+            yaxis=dict(gridcolor=_PLT_GRID, title='Annualised HV (%)'),
+            legend=dict(bgcolor=_PLT_LEG, bordercolor=_PLT_BDR),
+            height=320, margin=dict(t=10, b=40),
+            title=dict(text=f'{_active_tok_vs} Rolling Historical Volatility', font=dict(size=11, color='#5a9abf'))
+        )
+        st.plotly_chart(fig_xdc_hv, use_container_width=True, key=_next_chart_key())
+
+        # HV metrics cards
+        hv_cards = st.columns(len(windows))
+        for i, w in enumerate(windows):
+            if w in hv_series and len(hv_series[w]) > 0:
+                current_hv = hv_series[w][-1]
+                with hv_cards[i]:
+                    st.markdown(f'''<div class="metric-card" style="border-left-color:{hv_palette[i % len(hv_palette)]}">
+                        <div class="metric-label">{w}D HV</div>
+                        <div class="metric-value" style="font-size:18px;color:{hv_palette[i % len(hv_palette)]};">{current_hv:.1f}%</div>
+                        <div class="metric-sub">Annualised</div>
+                    </div>''', unsafe_allow_html=True)
+
+        # Synthetic XDC vol term structure from historical windows
+        st.markdown(f'<div class="section-header">{_active_tok_vs} SYNTHETIC VOL TERM STRUCTURE</div>', unsafe_allow_html=True)
+        tenor_days_ts = [7, 14, 30, 60, 90, 180]
+        xdc_hv_ts = []
+        for w in tenor_days_ts:
+            if w in hv_series and len(hv_series[w]) > 0:
+                xdc_hv_ts.append(hv_series[w][-1])
+            else:
+                xdc_hv_ts.append(None)
+
+        fig_xdc_ts = go.Figure()
+        valid_tenors = [t for t, v in zip(tenor_days_ts, xdc_hv_ts) if v is not None]
+        valid_hvs = [v for v in xdc_hv_ts if v is not None]
+        if valid_tenors:
+            fig_xdc_ts.add_trace(go.Scatter(
+                x=valid_tenors, y=valid_hvs,
+                name=f'{_active_tok_vs} HV Term Structure',
+                line=dict(color='#00d4ff', width=3),
+                mode='lines+markers', marker=dict(size=8, color='#00d4ff')
+            ))
+        fig_xdc_ts.update_layout(
+            plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+            font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=10),
+            xaxis=dict(gridcolor=_PLT_GRID, title='Tenor (days)'),
+            yaxis=dict(gridcolor=_PLT_GRID, title='HV (%)'),
+            height=260, margin=dict(t=10, b=40), showlegend=False
+        )
+        st.plotly_chart(fig_xdc_ts, use_container_width=True, key=_next_chart_key())
+    else:
+        st.info(f"Could not fetch {_active_tok_vs} price history for vol calculation.")
+
     # ── XDC VOL PROXY ─────────────────────────────────────────────────
     st.markdown(f'<div class="section-header">{st.session_state.get("active_token_ticker","XDC")} IMPLIED VOL PROXY — FROM BTC/ETH SURFACE</div>', unsafe_allow_html=True)
     st.markdown(
@@ -4495,6 +4817,63 @@ with tab10:
         hovermode="x unified"
     )
     st.plotly_chart(fig_ov, use_container_width=True, key=_next_chart_key())
+
+    # ── MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES ────────────────
+    st.markdown('<div class="section-header">MONTE CARLO EXPECTED P&L — TOP 3 STRATEGIES (10,000 PATHS)</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:11px;color:#5a7a99;margin-bottom:12px;line-height:1.8;">'
+        'Simulates 10,000 GBM paths to compute expected P&L distributions for the top 3 strategies. '
+        'Uses the current vol and drift assumptions.</div>',
+        unsafe_allow_html=True
+    )
+
+    np.random.seed(2024)
+    n_mc_strat = 10_000
+    T_mc_strat = sl_T_lab / 365
+    Z_mc_strat = np.random.standard_normal(n_mc_strat)
+    S_mc_terminal = spot * np.exp((r - 0.5 * sl_hv_lab**2) * T_mc_strat + sl_hv_lab * np.sqrt(T_mc_strat) * Z_mc_strat)
+
+    mc_strat_cols = st.columns(min(3, len(top_results)))
+    for si, (sname, ssc, _, sdef) in enumerate(top_results[:3]):
+        pr_mc, pay_mc, nprem_mc, legs_mc = build_strategy_payoff(
+            sname, sdef, spot, sl_hv_lab, T_mc_strat, r
+        )
+        if np.any(pay_mc != 0) and len(pr_mc) > 0:
+            # Interpolate payoff at simulated terminal prices
+            pnl_sims = np.interp(S_mc_terminal, pr_mc, pay_mc)
+            mean_pnl = np.mean(pnl_sims)
+            p_profit = np.mean(pnl_sims > 0) * 100
+            var_95 = np.percentile(pnl_sims, 5)
+            best_95 = np.percentile(pnl_sims, 95)
+
+            with mc_strat_cols[si]:
+                pnl_color = '#00e676' if mean_pnl > 0 else '#ff4b6e'
+                st.markdown(f'''
+                <div class="metric-card" style="border-left-color:{pnl_color}">
+                    <div class="metric-label">#{si+1} {sname}</div>
+                    <div class="metric-value" style="font-size:16px;color:{pnl_color};">E[P&L]: ${mean_pnl:.6f}</div>
+                    <div class="metric-sub">
+                        P(profit): {p_profit:.0f}% · VaR(5%): ${var_95:.6f} · Best(95%): ${best_95:.6f}
+                    </div>
+                </div>
+                ''', unsafe_allow_html=True)
+
+                # Mini histogram
+                fig_mc_mini = go.Figure(go.Histogram(
+                    x=pnl_sims, nbinsx=40,
+                    marker_color=pnl_color, marker_line_width=0, opacity=0.7
+                ))
+                fig_mc_mini.add_vline(x=0, line_color='#ffffff', line_dash='dot')
+                fig_mc_mini.add_vline(x=mean_pnl, line_color='#f0a500', line_dash='dash')
+                fig_mc_mini.update_layout(
+                    plot_bgcolor=_PLT_BG, paper_bgcolor=_PLT_BG,
+                    font=dict(family='IBM Plex Mono', color=_PLT_TXT, size=9),
+                    xaxis=dict(gridcolor=_PLT_GRID, title='P&L ($)'),
+                    yaxis=dict(gridcolor=_PLT_GRID), showlegend=False,
+                    height=180, margin=dict(t=5, b=30, l=10, r=10)
+                )
+                st.plotly_chart(fig_mc_mini, use_container_width=True, key=_next_chart_key())
 
     # ── FULL DEPOSITORY BROWSER ──────────────────────────────────────
     st.markdown(
